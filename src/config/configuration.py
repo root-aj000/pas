@@ -28,6 +28,7 @@ from src.entity.config_entity import (
     PipelineConfig,
 )
 from src.utils.common import (
+    describe_kaggle_input,
     find_kaggle_file,
     find_project_root,
     get_logger,
@@ -84,8 +85,10 @@ def resolve_data_file(raw: str | Path, description: str) -> Path:
         return found
     raise FileNotFoundError(
         f"{description} not found at {path}, and no file named {path.name} "
-        "exists under /kaggle/input/. Attach the competition data or place it "
-        "in data/."
+        "exists anywhere under /kaggle/input/.\n"
+        "Attach the competition data with the notebook's Add data button, or "
+        "place the files in data/.\n"
+        f"What is actually mounted:\n{describe_kaggle_input()}"
     )
 
 

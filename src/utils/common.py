@@ -82,19 +82,49 @@ def ensure_project_root(marker: str = "config.yaml") -> Path:
     return root
 
 
+def describe_kaggle_input(limit: int = 30) -> str:
+    """Return a listing of what is actually mounted under /kaggle/input.
+
+    Args:
+        limit: Maximum entries to list. Kaggle mounts are small, so this is a
+            safety cap rather than a real constraint.
+
+    Returns:
+        One path per line, or "(nothing mounted)" when the directory is absent.
+        Used in the error message so a missing dataset diagnoses itself instead
+        of just failing.
+    """
+    lines: list[str] = []
+    for mount in KAGGLE_INPUT_DIRS:
+        if not mount.is_dir():
+            lines.append(f"{mount}/  (not present - no dataset attached?)")
+            continue
+        entries = sorted(p for p in mount.rglob("*") if p.is_file())[:limit]
+        if not entries:
+            lines.append(f"{mount}/  (present but empty)")
+        lines.extend(f"  {path}" for path in entries)
+    return "\n".join(lines)
+
+
 def find_kaggle_file(filename: str) -> Path | None:
-    """Look for a data file in the Kaggle input mounts.
+    """Look for a data file in the Kaggle input mounts, at any depth.
 
     Args:
         filename: Just the file name, for example "train.csv".
 
     Returns:
         The first match, or None if there is none.
+
+    Note:
+    Recursive on purpose. A competition dataset may mount as
+    `/kaggle/input/<slug>/train.csv`, as
+    `/kaggle/input/<slug>/competitions/playground-series-s6e10/train.csv`, or
+    with the files one level deeper still. A one-level glob misses the last two.
     """
     for mount in KAGGLE_INPUT_DIRS:
         if not mount.is_dir():
             continue
-        for candidate in sorted(mount.glob(f"*/{filename}")):
+        for candidate in sorted(mount.rglob(filename)):
             if candidate.is_file():
                 return candidate
     return None
