@@ -1,0 +1,50 @@
+{
+  "model_name": "hist_gradient_boosting",
+  "model_params": {
+    "learning_rate": 0.06,
+    "max_iter": 400,
+    "max_leaf_nodes": 31,
+    "min_samples_leaf": 40,
+    "l2_regularization": 0.5,
+    "max_bins": 255,
+    "early_stopping": false
+  },
+  "random_seed": 42,
+  "git_commit": "unknown",
+  "validation_metrics": {
+    "roc_auc": 0.95440872770247,
+    "accuracy": 0.9155089284012731,
+    "f1": 0.9035807879255787,
+    "precision": 0.9149123579670572,
+    "recall": 0.89252647633778
+  },
+  "training_seconds": 8.77,
+  "train_rows": 489743,
+  "features": [
+    "Class_Business",
+    "Class_Eco",
+    "Class_Eco Plus",
+    "Type of Travel_Business travel",
+    "Type of Travel_Personal Travel",
+    "Customer Type_Loyal Customer",
+    "Customer Type_disloyal Customer",
+    "Online boarding",
+    "mean_service_rating",
+    "Inflight entertainment",
+    "Seat comfort",
+    "On-board service",
+    "Cleanliness",
+    "Leg room service",
+    "Flight Distance",
+    "Inflight wifi service",
+    "Age",
+    "Departure/Arrival time convenient",
+    "Gate location",
+    "Baggage handling",
+    "Ease of Online booking",
+    "Checkin service",
+    "Food and drink",
+    "worst_service_rating",
+    "count_of_ratings_at_or_below_2"
+  ]
+}

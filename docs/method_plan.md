@@ -1,0 +1,339 @@
+# Method Choice — Plan
+
+**Written:** 2026-10-04
+**Covers:** Steps 1 to 12 of [`.lead/02-C-CHOOSING-THE-METHOD.md`](../.lead/02-C-CHOOSING-THE-METHOD.md).
+**Status:** Steps 1, 2, 4, 5 **done**. Step 3 **worked around, not resolved**.
+Steps 6–12 **not started**.
+
+**The objective, as stated by the owner on 2026-10-04:** in a competition, get the
+most accurate model, make it easy to optimise and change hyperparameters, and
+keep the loss minimal. Training runs on Kaggle GPU — P100 or 2× T4.
+
+That objective is the tie-breaker for every choice below. Read section 3 before
+arguing with section 5.
+
+---
+
+## 1. Step 1 — Classify the problem
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | Task | **Binary classification** |
+| 2 | Data | **Tabular.** 23 columns, all numeric or short categorical. No text, image or audio |
+| 3 | One prediction is about | **One row** = one flight. No passenger id, so nothing spans rows |
+| 4 | Rows | **699,635** — far past 100k |
+| 5 | Speed needed | **Batch.** One submission file |
+| 6 | Must a human explain it | **No.** Nobody operationally consumes it |
+| 7 | Target | **A probability.** The template holds continuous values |
+
+`.lead/02-C` Step 1's own size rule puts over-100k tabular data at
+**"still gradient boosting first"**, and warns that neural networks are "the
+default answer for everything in tutorials, and they are routinely beaten by
+gradient boosting on spreadsheet-shaped problems."
+
+---
+
+## 2. Step 2 — Constraints, including the one that changed everything
+
+| Constraint | Value | What it eliminates |
+|---|---|---|
+| Latency budget | Batch, hours | Nothing |
+| Interpretability | Not required | Nothing |
+| Data privacy | None. Synthetic data, only `Age`/`Gender` touch a person | Nothing |
+| Retraining cost | Minutes on CPU | Nothing |
+| **Compute** | **Kaggle GPU: P100 16GB, or 2× T4** | **See below — this is the first constraint that does real work** |
+| **Kaggle memory ceiling** | **~30GB system RAM, not the 96GB you have locally** | Kills in-memory cross-validation over multiple 1GB copies; forces chunked or single-fit evaluation |
+| **Session time limit** | **Roughly 9–12 hours per notebook run** | Kills brute-force searches; demands a time limit set in advance |
+| Explainable to | Us | Nothing |
+
+### What the GPU constraint actually eliminates — and what it does not
+
+**It does almost nothing to the choice of algorithm, and that is the useful part
+of this section.** The measured workload is tiny:
+
+| Task | Time, measured or estimated |
+|---|---|
+| Fit `HistGradientBoosting` on 490k × 23, CPU | **under 60 seconds** |
+| Fit all four candidates + validation, CPU | a few minutes |
+| Optuna, 100 trials, CPU | roughly 1–2 hours |
+
+**The whole recommended path fits in a normal Kaggle CPU session.** The GPU only
+becomes the deciding factor if you choose the deep-learning route — and section 4
+is about whether to.
+
+---
+
+## 3. "ML or DL" — the honest answer
+
+You asked for a choice between two options. The framing is a false binary, and
+saying so is more useful than picking a side.
+
+### What "DL on tabular data" actually means here
+
+There is no image, no text, no audio. A deep learning approach would be an MLP
+over 23 numeric columns. Concretely, against the four requirements:
+
+| Requirement | Gradient boosting | Deep learning (MLP on tabular) |
+|---|---|---|
+| **Most accurate** | The measured default already hits 0.9573 AUC. GBM variants tune to ~0.96–0.97 on this dataset shape | A well-tuned MLP lands **within noise of GBM, usually slightly below**. `.lead/02-C` Step 1 says GBM "routinely" beats it on spreadsheet-shaped data |
+| **Easy to optimise** | Excellent. ~8 knobs that all matter: `learning_rate`, `max_depth`, `min_samples_leaf`, `subsample`, `colsample_bytree`, `reg_alpha`, `reg_lambda`, `n_estimators` | Harder. Needs `learning_rate`, batch size, epochs, architecture depth/width, dropout, weight decay, **and** a scheduler choice. More knobs, and they interact badly |
+| **Hyperparameter changes are cheap** | A trial is seconds. Hundreds of trials overnight | A trial is minutes. Meaningful search is 10–50× more expensive |
+| **Minimal loss** | Converges reliably. Low loss out of the box | Needs warmup, schedule, early stopping. Diverges or plateaus more often |
+
+### Where deep learning genuinely wins, and it is not here
+
+| DL wins when | This project |
+|---|---|
+| Images, text, audio, or very high-cardinality categoricals | 23 low-cardinality columns. No |
+| Millions of rows, where the model's extra capacity pays | 490k. GBM's sweet spot |
+| Complex interactions the trees cannot express | The EDA shows one dominant rating plus class effects. Trees are ideal |
+| You need to ensemble a genuinely different model family | Possible later, as a small blend on top of GBM |
+
+### The one thing that changes the answer
+
+**This is a Kaggle Playground dataset — it is synthetic**, generated by the
+competition organisers from a model fitted to the real airline survey. Its
+structure is unusually learnable, and leaderboard scores on these datasets are
+high across many methods.
+
+That cuts both ways: it makes the achievable ceiling high, and it makes
+overfitting to the synthetic generation process the main risk. GBM handles that
+cleanly with its regularisation knobs.
+
+### Recommendation
+
+> **Gradient boosting, ML path. Do not build a neural network.**
+
+Not because DL is bad — because on 23 tabular columns it will cost you 10–50× the
+tuning budget for a result that is, at best, a tie. `.lead/02-C` Step 10 says
+choosing the simpler model that meets the bar is a strong outcome, not a failure.
+
+**The strongest version of the DL idea is not "use a neural network instead".** It
+is: *after* the GBM comparison, fit one small MLP on the same features and check
+whether blending it with the GBM beats the GBM alone. That is a cheap experiment
+with an honest chance of a real gain, and it is Step 9's "read the errors" turned
+into a feature. Do that **after** the GBM path is finished, not instead of it.
+
+---
+
+## 4. P100 or 2× T4?
+
+**Take the 2× T4.** Details:
+
+| | P100 | T4 (Turing) |
+|---|---|---|
+| VRAM | 16 GB | 16 GB **each** → 32 GB total with 2 |
+| Tensor cores | **No** (Pascal, compute 6.1) | **Yes**, FP16 (Turing, compute 7.5) |
+| Multi-GPU | NVLink, fast | DDP, works well for this size |
+| Best for | FP32 compute, large single model | Two-model training, FP16, ensembles |
+
+| Workload | T4 ×2 vs P100 |
+|---|---|
+| GBM training (the recommended path) | **No difference.** Both are CPU-bound here. The GPU is idle either way |
+| MLP / any deep learning | **T4 ×2 clearly better.** Tensor cores for FP16, and DDP across two GPUs is close to 2× on a model this size |
+| Training a wide ensemble | **T4 ×2**, since 32 GB fits more concurrent models |
+
+**But note what that means:** the choice between P100 and T4 only matters if you
+go the DL route. Under the recommendation in section 3, **pick either and nothing
+changes** — the whole plan runs on Kaggle CPU. Take the T4 ×2 because it costs
+nothing and keeps the DL option open.
+
+### One thing to check before committing hardware
+
+`.dev/TOOLS.md` and the project rules do not assume Kaggle, so this is new
+ground. Confirm the GPU the competition actually offers, because Kaggle assigns it
+and you do not always get a choice. If only P100 is offered, the recommendation
+still stands — GBM does not care.
+
+---
+
+## 5. Step 5 — The shortlist, written before anything is scored
+
+Three to four *families*, each with a **reason**, not a score. Written before any
+of them runs, so nobody can quietly drop the ones that do badly.
+
+| # | Candidate | Why it is on the list | Tuning difficulty |
+|---|---|---|---|
+| 1 | **Logistic regression** | The simplest thing that could work, always included. Already fitted in the EDA. Fully explainable, and it is what found `Online boarding` as the top linear signal | 2 knobs |
+| 2 | **Decision tree, depth-limited** | The readability option. If it lands close to the winner it is a legitimate outcome, not a failure | 2 knobs |
+| 3 | **Random forest** | Handles mixed data with few settings. A middle point between one readable tree and boosting | 4 knobs |
+| 4 | **`HistGradientBoosting`** | **The expected winner.** `.lead/02-D` section 1's default first choice on tabular data, `.lead/02-C` Step 1's size rule, and the only candidate handling the 204 blank arrival delays natively | 6 knobs |
+| 5 | **XGBoost or LightGBM** | **Added because of your "easy to optimise" requirement.** Both have `device="cuda"`/`"gpu"`, first-class Optuna integration, and mature regularisation knobs (`reg_alpha`, `reg_lambda`, `colsample`, `subsample`). `.lead/02-D` lists both | 8–10 knobs |
+
+**On adding XGBoost/LightGBM.** `.dev/RULES.md` rule 9 says never add a dependency
+when something already installed does the job, and `HistGradientBoosting` is
+already installed. So this entry is justified only by your stated requirement.
+The honest position: `HistGradientBoosting` and XGBoost usually land within
+0.001–0.003 AUC of each other on tabular data, and XGBoost's advantages are
+control and tuning ergonomics rather than accuracy. **Include it because you asked
+for easy optimisation, and record that it did not win on score if that is what
+happens.** Install one — XGBoost — not all three.
+
+### Rejected, with reasons
+
+| Rejected | Why |
+|---|---|
+| **Neural network / MLP** | Section 3. Not excluded by a constraint — excluded by the data and by the tuning requirement |
+| **k-NN** | Needs scaling, slow at prediction, cannot extrapolate. `.lead/02-D` section 1 |
+| **SVM** | Slow at 490k rows, needs scaling |
+| **Naive Bayes** | Assumes independent features. The 13 ratings are one passenger's impression of one flight |
+| **CatBoost** | Its main advantage is native categorical handling. With four low-cardinality columns that is a rounding error, and it is another dependency |
+| **LightGBM** | Dropped in favour of XGBoost so only one extra dependency is added. Either is a fine substitute |
+
+---
+
+## 6. Step 3 — The metric: worked around, not resolved
+
+Open question 6 is still open. Evidence for **ROC-AUC**: the submission template
+holds continuous values; it is filled with the constant `0.44357272006117476`, the
+exact base rate, which scores 0.5 AUC — the floor for a ranking metric; and
+`Class == Business` reaches 0.8751 precision at 0.4311 recall, which is
+AUC-shaped.
+
+**Not proof.** Kaggle's page could not be reached, and per the standing constraint
+in [`open_questions.md`](open_questions.md) the API and access token are not used.
+
+### The workaround: report both metrics, always
+
+| Rule | Accuracy | ROC-AUC |
+|---|---|---|
+| `Class == Business` | 0.7770 | **0.7786** |
+| `Online boarding == 5` | 0.7206 | 0.6904 |
+| `Type of Travel == Business travel` | 0.6761 | 0.7027 |
+| `Customer Type == Loyal Customer` | 0.5487 | 0.5858 |
+| do nothing | 0.5564 | 0.5000 |
+
+The two metrics agree on the ranking, so the bar is settled either way. Every
+comparison from here reports both.
+
+---
+
+## 7. Step 4 — The baseline, confirmed
+
+| Model | Accuracy | ROC-AUC |
+|---|---|---|
+| do nothing | 0.5564 | 0.5000 |
+| `Class == Business` — **the bar to beat** | 0.7770 | 0.7786 |
+| `HistGradientBoosting`, **default settings, no tuning** | 0.924218 | 0.957312 |
+
+**The untuned default is the number to beat, not 0.7770.** It is 14.7 accuracy
+points past the one-column rule.
+
+It also kills the target proposed earlier: **ROC-AUC ≥ 0.87 is meaningless**, since
+an untuned default model passes it by nine points. The real target should be set
+from what a tuned model achieves, which is Step 8. Open question 7.
+
+---
+
+## 8. Steps 6–12 — not started
+
+| Step | What it involves | Blocked on |
+|---|---|---|
+| **6. Minimal working version per candidate** | Default settings, no tuning. Throwaway, in `research/` | Nothing |
+| **7. Wire them the same way** | One `MODEL_REGISTRY` so swapping is one config line — `.lead/02-A` | Nothing |
+| **8. Score on validation** | One table, one run, all candidates | Nothing |
+| **9. Read the errors** | What the winner still gets wrong. Then the MLP-blend experiment from section 3 | Step 8 |
+| **10. Pick the simplest that meets the bar** | The written decision rule, with the number | Step 8 |
+| **11. Tune the winner** | **One method, not five.** Time limit set in advance — the Kaggle session ceiling makes this mandatory | Step 10 |
+| **12. Document the choice** | Experiment log with numbers — `.lead/09-TEMPLATES.md` section 3 | Step 10 |
+
+### The comparison rules, fixed now so the comparison is honest
+
+| Rule | |
+|---|---|
+| Same features for every candidate | Otherwise we compare data, not methods |
+| Same split | Otherwise we compare luck |
+| Same metric — both of them | Otherwise the numbers mean nothing |
+| Same seed, 42 | Removes one source of randomness |
+| **Default settings first, no tuning** | `.lead/02-C` Step 11 is last, not first |
+| **Validation only. Test stays closed** | `.lead/01-DATA.md` Step 1.7 rule 3 |
+
+### The feature list — REVISED 2026-10-05, after measurement
+
+**This section originally recommended a 17-feature list, and that recommendation
+was wrong.** It dropped nine columns on their individual effect size, using
+`.dev/EDA.md`'s "delete a feature that stops being useful". Measuring what those
+columns were worth to the model instead:
+
+| Feature set | Features | ROC-AUC |
+|---|---|---|
+| The list originally recommended here | 17 | 0.9476 |
+| With the six ratings added back | 25 | **0.9531** |
+
+`Gender` and the two delay columns are genuinely dead — `+0.000000` and
+`−0.000048` in ablation — and stay out. The other six ratings each add between
++0.0003 and +0.0024 as interaction partners.
+
+**The lesson: `Departure/Arrival time convenient` has the worst individual effect
+size of the thirteen ratings, Cliff's delta −0.0525, and is the single biggest
+contributor to ROC-AUC.** A univariate statistic does not measure a column's
+value to a model. Never drop a feature on one alone.
+
+The full working is in [`eda_findings.md`](eda_findings.md) section 10 and
+[`experiment_log.md`](experiment_log.md) run 6.
+
+### The feature list as it stands
+
+25 features. Dropped: `Gender`, both delays. Kept despite negligible individual
+effect size: the six ratings listed above, plus `worst_service_rating` and
+`count_of_ratings_at_or_below_2`.
+
+| Keep | Drop — effect size below 0.06 |
+|---|---|
+| `Class`, `Type of Travel`, `Customer Type` | `Gender` (V 0.008) |
+| `Online boarding`, `mean_service_rating` | `Gate location` (δ 0.028) |
+| `Inflight entertainment`, `Seat comfort`, `On-board service`, `Cleanliness`, `Leg room service` | `Departure Delay` (δ −0.018) |
+| `Flight Distance`, `Inflight wifi service`, `Age` | `Arrival Delay` (δ −0.032) |
+| | `Departure/Arrival time convenient` (δ −0.053) |
+
+`.dev/EDA.md` says delete a feature that stops being useful rather than keep it
+"just in case" — but dropping features is a **decision**, and `.lead/02-B` Step 2.7
+wants it explained. Two open questions bear on it: whether `0` in twelve ratings
+is a real lowest rating or a hidden "not applicable"
+([`column_dictionary.md`](column_dictionary.md) Note 3), and why
+`count_of_ratings_at_or_below_2` breaks monotonicity at exactly four bad ratings.
+
+Neither blocks the comparison — the raw ratings can be used as they are.
+
+### A note on Kaggle specifically
+
+Everything above runs on Kaggle **CPU**. Two practical consequences:
+
+| | |
+|---|---|
+| **Memory** | Kaggle gives ~30GB RAM, not your 96GB. Loading `train.csv` (67MB) plus one-hot columns is fine. Cross-validation that copies the frame five times is not. Use a single fit on train with a held-out validation split — which is what the frozen split already is |
+| **Time** | Set an explicit budget before Step 11 and honour it. `.lead/03` Step 3.4: "A search that keeps finding 0.1% gains for six hours is not useful" |
+
+---
+
+## Gate status for `.lead/02-C`
+
+- [x] Problem classified: task type, data type, unit of prediction, size
+- [x] Constraints written down — including the GPU and Kaggle memory ceilings
+- [ ] Metric agreed — **worked around by reporting both.** Question 6 open
+- [x] Trivial and simple-rule baselines present, on both metrics
+- [x] 4–5 candidates listed with a reason each, written before scoring
+- [ ] Every candidate run once with defaults on the same split
+- [ ] Every candidate scored with the same metric, features and seed
+- [ ] Errors of the top candidate read by a human
+- [ ] The simplest option that meets the bar chosen, with reasoning written
+- [ ] The winner wired through `MODEL_REGISTRY`
+- [ ] Choice recorded in the experiment log with numbers
+
+**Five of eleven.** Stopping here, per `.lead/02-C`: *"If any box is unticked:
+stop. You are about to tune a method you have not chosen."*
+
+---
+
+## What has changed
+
+- **2026-10-04:** first version.
+- **2026-10-04, revised after the owner supplied three constraints:** Kaggle GPU
+  training, "most accurate model", and "easy to optimise with minimal loss". This
+  added the compute, memory and session-time constraints to Step 2; added
+  sections 3 (ML vs DL) and 4 (P100 vs 2× T4); and added XGBoost to the shortlist
+  because it serves the tuning requirement. It also corrected the earlier claim
+  that "these constraints eliminate nothing" — they eliminate nothing
+  *algorithmically*, but the Kaggle memory ceiling and session limit are real.
+- **2026-10-04, same day:** the proposed ROC-AUC target of 0.87 was removed as
+  meaningless — an untuned default model reaches 0.9573.

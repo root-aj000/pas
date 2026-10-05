@@ -1,0 +1,17 @@
+.venv/
+
+# Rebuilt by every run. .dev/PROJECT-STRUCTURE.md says both of these are
+# "safe to delete" and must be kept out of git.
+artifacts/
+reports/
+# Trained model binaries. .dev/RULES.md rule 12: never commit model binaries.
+# Everything else in models/ - features.json, config.json, model_card.md - is
+# text and belongs in git, because that is what makes a model reproducible.
+models/**/*.pkl
+
+*.pyc
+__pycache__/
+*.log
+*.logs
+/*.md
+data/

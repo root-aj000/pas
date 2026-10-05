@@ -1,0 +1,31 @@
+{
+  "features": [
+    "Class_Business",
+    "Class_Eco",
+    "Class_Eco Plus",
+    "Type of Travel_Business travel",
+    "Type of Travel_Personal Travel",
+    "Customer Type_Loyal Customer",
+    "Customer Type_disloyal Customer",
+    "Online boarding",
+    "mean_service_rating",
+    "Inflight entertainment",
+    "Seat comfort",
+    "On-board service",
+    "Cleanliness",
+    "Leg room service",
+    "Flight Distance",
+    "Inflight wifi service",
+    "Age",
+    "Departure/Arrival time convenient",
+    "Gate location",
+    "Baggage handling",
+    "Ease of Online booking",
+    "Checkin service",
+    "Food and drink",
+    "worst_service_rating",
+    "count_of_ratings_at_or_below_2"
+  ],
+  "target_column": "satisfaction",
+  "derived_features": "see config.yaml"
+}

@@ -1,0 +1,7 @@
+mode=FULL folds=5 seed=42
+member xgboost 0.958844
+member lightgbm 0.958043
+member catboost 0.957863
+blend uniform average 0.958794
+blend suggested 0.45/0.35/0.20 0.958871
+blend OOF-fitted weights 0.958914
