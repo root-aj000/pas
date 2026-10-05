@@ -8,9 +8,14 @@
 # records which settings produced which result.
 
 # --- Paths -------------------------------------------------------------------
-data_path: "/kaggle/input/competitions/playground-series-s6e10/train.csv"
-competition_test_path: "/kaggle/input/competitions/playground-series-s6e10/test.csv"
-sample_submission_path: "/kaggle/input/competitions/playground-series-s6e10/sample_submission.csv"
+# Relative paths. Resolved against the project root on any machine, so this file
+# is never edited per machine. On Kaggle, where data/ does not exist, the reader
+# scans /kaggle/input/ for the same filenames automatically - see
+# docs/kaggle_gpu_runbook.md. Do NOT put absolute Kaggle paths here; an absolute
+# path is honoured untouched and breaks every other machine.
+data_path: "data/train.csv"
+competition_test_path: "data/test.csv"
+sample_submission_path: "data/sample_submission.csv"
 
 artifacts_path: "artifacts"
 models_path: "models"

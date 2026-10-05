@@ -19,6 +19,13 @@ Do NOT use the Kaggle API or any access token. Upload through the website and
 attach through the notebook's **Add data** button. Standing project rule — see
 `docs/open_questions.md`.
 
+Do NOT edit `config.yaml` paths. They are relative (`data/train.csv`) and resolve
+against the project root on any machine. When `data/` is absent, the pipeline scans
+`/kaggle/input/` for the same filenames automatically and logs which file it found.
+An absolute Kaggle path in `config.yaml` is honoured untouched — and breaks every
+machine that is not Kaggle. That happened once already; the comment in `config.yaml`
+says so.
+
 ## 2. Set up (first cell)
 
 ```python

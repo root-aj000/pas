@@ -27,8 +27,66 @@ from src.entity.config_entity import (
     ModelTrainerConfig,
     PipelineConfig,
 )
+from src.utils.common import (
+    find_kaggle_file,
+    find_project_root,
+    get_logger,
+)
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
+
+
+def resolve_project_path(raw: str | Path) -> Path:
+    """Return an absolute path for a setting from config.yaml.
+
+    Args:
+        raw: The value as written, usually relative like "data/train.csv".
+
+    Returns:
+        The value resolved against the project root, unless it was already
+        absolute. An absolute value in config.yaml always wins, untouched.
+    """
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return find_project_root() / path
+
+
+def resolve_data_file(raw: str | Path, description: str) -> Path:
+    """Return the data file to read, from the project tree or Kaggle.
+
+    Args:
+        raw: The value from config.yaml.
+        description: What the file is, used in the error message.
+
+    Returns:
+        The file to read.
+
+    Raises:
+        FileNotFoundError: If it is in neither place, listing everywhere checked.
+
+    Note:
+    Local files win. Only when the project tree lacks the file are the Kaggle
+    input mounts scanned for the same filename. A found file is logged loudly -
+    silently reading data from elsewhere is how results stop being reproducible.
+    """
+    path = resolve_project_path(raw)
+    if path.exists():
+        return path
+    found = find_kaggle_file(path.name)
+    if found is not None:
+        get_logger().warning(
+            "%s not found at %s. Using Kaggle input %s instead.",
+            description,
+            path,
+            found,
+        )
+        return found
+    raise FileNotFoundError(
+        f"{description} not found at {path}, and no file named {path.name} "
+        "exists under /kaggle/input/. Attach the competition data or place it "
+        "in data/."
+    )
 
 
 def load_yaml_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
@@ -93,8 +151,13 @@ class PipelineConfigReader:
     """
 
     def __init__(self, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
-        self.config_path = config_path
-        self.config = load_yaml_config(config_path)
+        resolved = (
+            config_path
+            if config_path.is_absolute() or config_path.exists()
+            else resolve_project_path(config_path)
+        )
+        self.config_path = resolved
+        self.config = load_yaml_config(resolved)
 
     def _read_categorical_encoding(self) -> str:
         """Return the categorical encoding, checked against the two we support.
@@ -129,11 +192,16 @@ class PipelineConfigReader:
         banned = frozenset(require_key(self.config, "banned_features"))
         required = frozenset(CANDIDATE_FEATURE_COLUMNS) | frozenset({TARGET_COLUMN})
         return DataIngestionConfig(
-            data_path=Path(require_key(self.config, "data_path")),
-            competition_test_path=Path(
-                require_key(self.config, "competition_test_path")
+            data_path=resolve_data_file(
+                require_key(self.config, "data_path"), "Training data"
             ),
-            artifacts_dir=Path(require_key(self.config, "artifacts_path")),
+            competition_test_path=resolve_data_file(
+                require_key(self.config, "competition_test_path"),
+                "Competition test data",
+            ),
+            artifacts_dir=resolve_project_path(
+                require_key(self.config, "artifacts_path")
+            ),
             required_columns=required,
             banned_features=banned,
         )
@@ -184,7 +252,9 @@ class PipelineConfigReader:
             aux_features_enabled=bool(
                 self.config.get("auxiliary_features", {}).get("enabled", False)
             ),
-            artifacts_dir=Path(require_key(self.config, "artifacts_path"))
+            artifacts_dir=resolve_project_path(
+                require_key(self.config, "artifacts_path")
+            )
             / "data_cleaning_encoding",
         )
 
@@ -199,10 +269,12 @@ class PipelineConfigReader:
             The stage 3 settings.
         """
         return ModelTrainerConfig(
-            train_data_path=Path(require_key(self.config, "artifacts_path"))
+            train_data_path=resolve_project_path(
+                require_key(self.config, "artifacts_path")
+            )
             / "data_cleaning_encoding"
             / "train.csv",
-            model_dir=Path(require_key(self.config, "models_path"))
+            model_dir=resolve_project_path(require_key(self.config, "models_path"))
             / f"model_{model_version}",
             model_name=str(require_key(self.config, "model_name")),
             model_params=dict(require_key(self.config, "model_params")),
@@ -222,9 +294,12 @@ class PipelineConfigReader:
         Returns:
             The stage 4 settings.
         """
-        artifacts_root = Path(require_key(self.config, "artifacts_path"))
+        artifacts_root = resolve_project_path(
+            require_key(self.config, "artifacts_path")
+        )
         model_dir = (
-            Path(require_key(self.config, "models_path")) / f"model_{model_version}"
+            resolve_project_path(require_key(self.config, "models_path"))
+            / f"model_{model_version}"
         )
         return ModelEvaluationConfig(
             validation_data_path=artifacts_root
@@ -237,17 +312,18 @@ class PipelineConfigReader:
             competition_test_path=artifacts_root
             / "data_cleaning_encoding"
             / "competition_test.csv",
-            sample_submission_path=Path(
-                require_key(self.config, "sample_submission_path")
+            sample_submission_path=resolve_data_file(
+                require_key(self.config, "sample_submission_path"),
+                "Submission template",
             ),
             model_path=model_dir / "model.pkl",
             features_path=model_dir / "features.json",
             target_column=str(require_key(self.config, "target_column")),
             decision_threshold=float(require_key(self.config, "decision_threshold")),
             metrics=list(require_key(self.config, "metrics")),
-            report_dir=Path(require_key(self.config, "report_path"))
+            report_dir=resolve_project_path(require_key(self.config, "report_path"))
             / f"model_{model_version}",
-            submission_dir=Path(require_key(self.config, "report_path"))
+            submission_dir=resolve_project_path(require_key(self.config, "report_path"))
             / "submissions",
         )
 
@@ -265,7 +341,9 @@ class PipelineConfigReader:
             cleaning=self.create_cleaning_config(),
             training=self.create_training_config(model_version),
             evaluation=self.create_evaluation_config(model_version),
-            models_root=Path(require_key(self.config, "models_path")),
-            report_root=Path(require_key(self.config, "report_path")),
-            artifacts_root=Path(require_key(self.config, "artifacts_path")),
+            models_root=resolve_project_path(require_key(self.config, "models_path")),
+            report_root=resolve_project_path(require_key(self.config, "report_path")),
+            artifacts_root=resolve_project_path(
+                require_key(self.config, "artifacts_path")
+            ),
         )

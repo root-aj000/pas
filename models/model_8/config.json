@@ -1,0 +1,51 @@
+{
+  "model_name": "xgboost",
+  "model_params": {
+    "max_depth": 8,
+    "n_estimators": 1400,
+    "learning_rate": 0.1,
+    "subsample": 1.0,
+    "colsample_bytree": 0.6,
+    "reg_alpha": 0.01,
+    "reg_lambda": 2.0,
+    "gamma": 0.1,
+    "max_bin": 1024,
+    "tree_method": "hist",
+    "device": "gpu"
+  },
+  "random_seed": 42,
+  "git_commit": "143c39b",
+  "validation_metrics": {
+    "roc_auc": 0.9588440378412583,
+    "accuracy": 0.9259238084348141,
+    "f1": 0.9154227773184211,
+    "precision": 0.9273889562438002,
+    "recall": 0.9037614659190994
+  },
+  "training_seconds": 22.12,
+  "train_rows": 489743,
+  "features": [
+    "Gender",
+    "Customer Type",
+    "Type of Travel",
+    "Class",
+    "Online boarding",
+    "mean_service_rating",
+    "Inflight entertainment",
+    "Seat comfort",
+    "On-board service",
+    "Cleanliness",
+    "Leg room service",
+    "Flight Distance",
+    "Inflight wifi service",
+    "Age",
+    "Departure/Arrival time convenient",
+    "Gate location",
+    "Baggage handling",
+    "Ease of Online booking",
+    "Checkin service",
+    "Food and drink",
+    "worst_service_rating",
+    "count_of_ratings_at_or_below_2"
+  ]
+}

@@ -27,6 +27,7 @@ from src.pipeline.stage_03_model_training import run_pipeline as run_stage_03
 from src.pipeline.stage_04_model_evaluation import run_pipeline as run_stage_04
 from src.utils.common import (
     build_run_log_name,
+    ensure_project_root,
     log_run_footer,
     log_run_header,
     log_step,
@@ -35,7 +36,9 @@ from src.utils.common import (
 )
 
 COMMAND = "python run_pipeline.py"
-CONFIG_PATH = Path("/kaggle/working/pas/config.yaml")
+# Resolved against the project root at startup, so this file runs from any
+# directory on any machine. A hardcoded absolute path lived here briefly and
+# broke every run that was not on that one machine.
 
 
 class RunLogWriter:
@@ -88,12 +91,17 @@ def main() -> int:
         turn on having it.
     """
     started_at = datetime.now().astimezone()
+    ensure_project_root()
     setup_logging()
     reader = PipelineConfigReader()
     seed = int(reader.config["random_seed"])
 
-    run_log = RunLogWriter(Path(reader.config["log_path"]), "full_run", started_at)
-    log_run_header(COMMAND, CONFIG_PATH, seed)
+    from src.config.configuration import resolve_project_path
+
+    run_log = RunLogWriter(
+        resolve_project_path(reader.config["log_path"]), "full_run", started_at
+    )
+    log_run_header(COMMAND, reader.config_path, seed)
 
     exit_code = 0
     status = "SUCCESS"
@@ -115,7 +123,9 @@ def main() -> int:
         log_step("run", stage="04_model_evaluation")
         run_stage_04(model_version=model_version)
 
-        submission_dir = Path(reader.config["report_path"]) / "submissions"
+        submission_dir = (
+            resolve_project_path(reader.config["report_path"]) / "submissions"
+        )
         written = sorted(submission_dir.glob("submission_model_*.csv"))
         if written:
             facts["submission"] = written[-1].name

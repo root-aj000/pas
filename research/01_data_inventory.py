@@ -22,7 +22,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-DATA_PATH = Path("data")
+# Resolved from this file's location, not the working directory.
+DATA_PATH = Path(__file__).resolve().parent.parent / "data"
 
 # Columns that are a rating on a fixed scale. Their expected range is checked
 # against EXPECTED_RATING_RANGE below.

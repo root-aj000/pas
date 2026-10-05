@@ -24,6 +24,81 @@ import pandas as pd
 
 LOGGER_NAME = "pipeline"
 
+# Where Kaggle mounts attached datasets. Read-only. If a data file is missing
+# from the project tree, these directories are scanned for a matching filename
+# before giving up. Local files always win - this never overrides data/ when it
+# exists.
+KAGGLE_INPUT_DIRS = (Path("/kaggle/input"),)
+
+
+def find_project_root(marker: str = "config.yaml") -> Path:
+    """Return the project root: the directory holding config.yaml.
+
+    Args:
+        marker: The file that identifies the root.
+
+    Returns:
+        The project root as an absolute path.
+
+    Raises:
+        FileNotFoundError: If no directory from here up to the filesystem root
+            holds the marker. Lists everywhere it looked.
+    """
+    searched: list[Path] = []
+    candidates = [
+        Path.cwd(),
+        *Path.cwd().parents,
+        Path(__file__).resolve(),
+        *Path(__file__).resolve().parents,
+    ]
+    for directory in dict.fromkeys(candidates):
+        searched.append(directory)
+        if (directory / marker).exists():
+            return directory.resolve()
+    raise FileNotFoundError(
+        f"Could not find {marker} in the current directory or any parent, "
+        f"nor near {__file__}. Looked in: {[str(d) for d in searched]}. "
+        "Run from inside the project, or clone it first."
+    )
+
+
+def ensure_project_root(marker: str = "config.yaml") -> Path:
+    """Change into the project root so relative paths work from anywhere.
+
+    Args:
+        marker: The file that identifies the root.
+
+    Returns:
+        The project root.
+
+    Note:
+    Every entry point - run_pipeline.py and each research script - calls this
+    first. That is the single reason `Path("data/train.csv")` works whether you
+    run `python run_pipeline.py` from the root, `python research/foo.py` from
+    anywhere, or `python /kaggle/working/pas/run_pipeline.py` from a notebook.
+    """
+    root = find_project_root(marker)
+    os.chdir(root)
+    return root
+
+
+def find_kaggle_file(filename: str) -> Path | None:
+    """Look for a data file in the Kaggle input mounts.
+
+    Args:
+        filename: Just the file name, for example "train.csv".
+
+    Returns:
+        The first match, or None if there is none.
+    """
+    for mount in KAGGLE_INPUT_DIRS:
+        if not mount.is_dir():
+            continue
+        for candidate in sorted(mount.glob(f"*/{filename}")):
+            if candidate.is_file():
+                return candidate
+    return None
+
 
 def setup_logging(name: str = LOGGER_NAME) -> logging.Logger:
     """Return a logger that prints to the console with a timestamp.

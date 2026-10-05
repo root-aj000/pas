@@ -33,6 +33,10 @@ from pathlib import Path
 # `python run_pipeline.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.utils.common import ensure_project_root
+
+ensure_project_root()
+
 import pandas as pd
 
 from src.components.model_training import build_model

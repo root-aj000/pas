@@ -144,3 +144,126 @@ def test_every_stage_module_exposes_run_pipeline() -> None:
         assert callable(module.run_pipeline)
 
     assert STAGE_01 == "stage_01_data_ingestion"
+
+
+def test_find_project_root_returns_the_directory_holding_config_yaml(
+    tmp_path, monkeypatch
+) -> None:
+    """The root is wherever config.yaml lives, not wherever you run from."""
+    from src.utils.common import find_project_root
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "config.yaml").write_text("seed: 42\n")
+    monkeypatch.chdir(root)
+
+    assert find_project_root() == root.resolve()
+
+
+def test_find_project_root_searches_parents(tmp_path, monkeypatch) -> None:
+    """Running from a subdirectory must still find the root above it."""
+    from src.utils.common import find_project_root
+
+    root = tmp_path / "proj"
+    (root / "nested" / "deep").mkdir(parents=True)
+    (root / "config.yaml").write_text("seed: 42\n")
+    monkeypatch.chdir(root / "nested" / "deep")
+
+    assert find_project_root() == root.resolve()
+
+
+def test_find_project_root_fails_loudly_for_a_marker_that_exists_nowhere(
+    tmp_path, monkeypatch
+) -> None:
+    """The error must say what was missing and where it looked.
+
+    find_project_root also searches near its own file, so with the package
+    importable it always finds the real project. That fallback is what makes
+    Kaggle work. A marker that exists nowhere tests the failure message itself.
+    """
+    from src.utils.common import find_project_root
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.chdir(empty)
+
+    with pytest.raises(FileNotFoundError, match="no_such_file"):
+        find_project_root(marker="no_such_file_xyz.yaml")
+
+
+def test_find_project_root_prefers_cwd_over_package_location(
+    tmp_path, monkeypatch
+) -> None:
+    """A config.yaml in the working tree must win over the installed package.
+
+    Otherwise local edits would be silently ignored in favour of wherever the
+    package happens to be installed.
+    """
+    from src.utils.common import find_project_root
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "config.yaml").write_text("seed: 42\n")
+    monkeypatch.chdir(root)
+
+    assert find_project_root() == root.resolve()
+
+
+def test_kaggle_input_is_used_only_when_local_data_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    """Local data/ always wins. Kaggle is the fallback, not the default."""
+    from src.config.configuration import resolve_data_file
+    from src.utils import common
+
+    root = tmp_path / "proj"
+    (root / "data").mkdir(parents=True)
+    local = root / "data" / "train.csv"
+    local.write_text("id\n0\n")
+    (root / "config.yaml").write_text("seed: 42\n")
+
+    fake_kaggle = tmp_path / "kaggle" / "input" / "competition"
+    fake_kaggle.mkdir(parents=True)
+    (fake_kaggle / "train.csv").write_text("id\n9\n")
+
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(common, "KAGGLE_INPUT_DIRS", (tmp_path / "kaggle" / "input",))
+
+    assert resolve_data_file("data/train.csv", "Training data") == local.resolve()
+
+
+def test_kaggle_input_is_found_when_local_data_is_absent(tmp_path, monkeypatch) -> None:
+    """A repo cloned without data/ must still find the Kaggle mount."""
+    from src.config.configuration import resolve_data_file
+    from src.utils import common
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "config.yaml").write_text("seed: 42\n")
+
+    fake_kaggle = tmp_path / "kaggle" / "input" / "competition"
+    fake_kaggle.mkdir(parents=True)
+    remote = fake_kaggle / "train.csv"
+    remote.write_text("id\n9\n")
+
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(common, "KAGGLE_INPUT_DIRS", (tmp_path / "kaggle" / "input",))
+
+    assert resolve_data_file("data/train.csv", "Training data") == remote.resolve()
+
+
+def test_missing_everywhere_lists_both_places_checked(tmp_path, monkeypatch) -> None:
+    """If neither has it, the error must name both places, not just one."""
+    from src.config.configuration import resolve_data_file
+    from src.utils import common
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "config.yaml").write_text("seed: 42\n")
+    (tmp_path / "kaggle" / "input").mkdir(parents=True)
+
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(common, "KAGGLE_INPUT_DIRS", (tmp_path / "kaggle" / "input",))
+
+    with pytest.raises(FileNotFoundError, match="/kaggle/input"):
+        resolve_data_file("data/train.csv", "Training data")

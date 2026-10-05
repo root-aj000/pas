@@ -1,0 +1,35 @@
+{
+  "features": [
+    "Gender",
+    "Customer Type",
+    "Type of Travel",
+    "Class",
+    "Online boarding",
+    "mean_service_rating",
+    "Inflight entertainment",
+    "Seat comfort",
+    "On-board service",
+    "Cleanliness",
+    "Leg room service",
+    "Flight Distance",
+    "Inflight wifi service",
+    "Age",
+    "Departure/Arrival time convenient",
+    "Gate location",
+    "Baggage handling",
+    "Ease of Online booking",
+    "Checkin service",
+    "Food and drink",
+    "worst_service_rating",
+    "count_of_ratings_at_or_below_2"
+  ],
+  "target_column": "satisfaction",
+  "categorical_encoding": "native",
+  "categorical_columns": [
+    "Gender",
+    "Customer Type",
+    "Type of Travel",
+    "Class"
+  ],
+  "derived_features": "see config.yaml"
+}

@@ -31,6 +31,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.utils.common import ensure_project_root
+
+ensure_project_root()
+
 import numpy as np
 import pandas as pd
 import torch

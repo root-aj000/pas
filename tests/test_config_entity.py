@@ -99,11 +99,14 @@ def test_reader_builds_every_stage_config(tmp_path) -> None:
     training = reader.create_training_config(model_version=3)
     evaluation = reader.create_evaluation_config(model_version=3)
 
-    assert ingestion.data_path == Path("data/train.csv")
+    # Paths resolve against the project root, so the pipeline runs from any
+    # directory on any machine. Relative in config.yaml, absolute everywhere else.
+    assert ingestion.data_path == Path("data/train.csv").resolve()
+    assert ingestion.data_path.is_absolute()
     assert "satisfaction" in ingestion.required_columns
     assert cleaning.test_size == 0.15
-    assert training.model_dir == Path("models/model_3")
-    assert evaluation.model_path == Path("models/model_3/model.pkl")
+    assert training.model_dir == Path("models/model_3").resolve()
+    assert evaluation.model_path == Path("models/model_3/model.pkl").resolve()
 
 
 def test_model_versions_do_not_overwrite_each_other(tmp_path) -> None:

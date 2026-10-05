@@ -66,7 +66,9 @@ REQUIRED_COLUMNS = set(SERVICE_RATING_COLUMNS) | {
     "Arrival Delay in Minutes",
 }
 
-TRAIN_PATH = Path("data/train.csv")
+# Resolved from this file's location, not the working directory, so the script
+# runs from anywhere. Kept stdlib-only by design - see the module docstring.
+TRAIN_PATH = Path(__file__).resolve().parent.parent / "data" / "train.csv"
 
 logger = logging.getLogger("baselines")
 
