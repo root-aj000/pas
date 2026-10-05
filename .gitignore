@@ -13,5 +13,6 @@ models/**/*.pkl
 __pycache__/
 *.log
 *.logs
-/*.md
+*.md
 data/
+.json

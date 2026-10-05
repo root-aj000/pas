@@ -1,0 +1,10 @@
+# Ruff configuration. See .dev/CODE-STANDARDS.md.
+#
+# Two jobs: enforce the rules we write code by, and leave other people's
+# reference material alone. research/s6e10-*.ipynb is a downloaded Kaggle
+# solution used for comparison - linting it would mean fixing 27 style issues
+# in someone else's notebook, which is not our code to fix.
+[tool.ruff]
+extend-exclude = [
+    "research/s6e10-*.ipynb",
+]

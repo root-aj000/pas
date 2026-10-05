@@ -1,0 +1,10 @@
+# What Kaggle already ships. Do NOT install requirements.txt here.
+#
+# Kaggle's GPU image already has: pandas, numpy, scipy, scikit-learn, xgboost
+# (GPU build), lightgbm, catboost, torch (GPU build), optuna, matplotlib.
+# Installing our 130-package requirements.txt would replace the GPU-enabled
+# xgboost with a CPU build and silently ignore device="cuda".
+#
+# Install ONLY what Kaggle does not ship:
+pytabkit
+optuna-integration[xgboost]
