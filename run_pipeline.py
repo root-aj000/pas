@@ -35,7 +35,7 @@ from src.utils.common import (
 )
 
 COMMAND = "python run_pipeline.py"
-CONFIG_PATH = Path("config.yaml")
+CONFIG_PATH = Path("/kaggle/working/pas/config.yaml")
 
 
 class RunLogWriter:
