@@ -17,6 +17,7 @@ is to find out which ones are, using numbers instead of opinion.
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -101,8 +102,8 @@ def score(
     train_data: pd.DataFrame,
     validation_data: pd.DataFrame,
     label: str,
-    params: dict[str, object] | None = None,
-) -> dict[str, object]:
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Fit HistGradientBoosting on train and score ROC-AUC on validation.
 
     Args:
@@ -151,7 +152,7 @@ def main() -> None:
         [validation_data, extras_validation, zeros_validation], axis=1
     )
 
-    results: list[dict[str, object]] = []
+    results: list[dict[str, Any]] = []
 
     print("=" * 88)
     print(
@@ -234,7 +235,7 @@ def main() -> None:
     # `.lead/03-TRAIN-AND-TUNE.md` Step 3.4 lists these as the settings worth
     # tuning, in order of impact. These are hand-set values to size the prize
     # before deciding whether Optuna is worth installing.
-    settings_candidates: list[tuple[str, dict[str, object]]] = [
+    settings_candidates: list[tuple[str, dict[str, Any]]] = [
         (
             "lower learning rate 0.02, more trees",
             {"learning_rate": 0.02, "max_iter": 900, "early_stopping": False},

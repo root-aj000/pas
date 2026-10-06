@@ -70,9 +70,7 @@ def load_members(
     ]
     if missing:
         raise SystemExit(f"missing predictions for: {missing}")
-    oof = np.column_stack(
-        [logit(np.load(members_dir / f"oof_{n}.npy")) for n in names]
-    )
+    oof = np.column_stack([logit(np.load(members_dir / f"oof_{n}.npy")) for n in names])
     test = np.column_stack(
         [logit(np.load(members_dir / f"test_{n}.npy")) for n in names]
     )

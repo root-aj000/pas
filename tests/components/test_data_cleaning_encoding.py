@@ -4,6 +4,8 @@ Tests for src/components/data_cleaning_encoding.py
 Run with: pytest tests/components/test_data_cleaning_encoding.py -v
 """
 
+from typing import Any
+
 import pandas as pd
 import pytest
 
@@ -29,7 +31,7 @@ def make_config(tmp_path, **overrides) -> DataCleaningConfig:
     Returns:
         A DataCleaningConfig pointing at a temporary folder.
     """
-    defaults: dict[str, object] = {
+    defaults: dict[str, Any] = {
         "target_column": "satisfaction",
         "features": ["Online boarding"],
         "candidate_features_pending_question": [],
@@ -65,7 +67,7 @@ def make_small_frame(rows: int = 100) -> pd.DataFrame:
     Returns:
         A frame with ids, the label, the ratings and the categoricals.
     """
-    data: dict[str, object] = {
+    data: dict[str, Any] = {
         "id": list(range(rows)),
         # Alternating labels so stratification has something to work with.
         "satisfaction": [bool(index % 2) for index in range(rows)],
@@ -287,7 +289,7 @@ def make_routable_frame(rows: int = 200) -> "pd.DataFrame":
     from src.constants import SERVICE_RATING_COLUMNS
 
     distances = [500, 500, 1000, 1000, 2000]
-    data: dict[str, object] = {
+    data: dict[str, Any] = {
         "id": list(range(rows)),
         "satisfaction": [bool(index % 2) for index in range(rows)],
         "Age": [30 + (index % 20) for index in range(rows)],

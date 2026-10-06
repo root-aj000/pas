@@ -33,6 +33,7 @@ Validation only. The test split stays closed.
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -318,7 +319,7 @@ def main() -> None:
     print("=" * 94)
 
     members: dict[str, np.ndarray] = {}
-    rows: list[dict[str, object]] = []
+    rows: list[dict[str, Any]] = []
 
     for name, fitter in (
         ("xgboost_one_hot", fit_xgboost_one_hot),

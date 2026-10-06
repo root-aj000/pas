@@ -26,6 +26,7 @@ nothing about what generalises.
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -73,7 +74,7 @@ SEARCH_SPACE: dict[str, list[object]] = {
 
 
 def fit_and_score(
-    train_data: pd.DataFrame, validation_data: pd.DataFrame, params: dict[str, object]
+    train_data: pd.DataFrame, validation_data: pd.DataFrame, params: dict[str, Any]
 ) -> tuple[float, float]:
     """Fit XGBoost with the given settings and return its validation AUC and fit time.
 
@@ -111,7 +112,7 @@ def main() -> None:
     print("the target:           0.965000 test")
     print()
 
-    search_rows: list[dict[str, object]] = []
+    search_rows: list[dict[str, Any]] = []
     search_started = time.monotonic()
     for trial in range(1, SEARCH_TRIALS + 1):
         params = {
@@ -145,7 +146,7 @@ def main() -> None:
     print(f"CONFIRM PHASE - top {CONFIRM_TOP_N} at {CONFIRM_TREES} trees")
     print("=" * 96)
 
-    confirm_rows: list[dict[str, object]] = []
+    confirm_rows: list[dict[str, Any]] = []
     for _, row in search_table.head(CONFIRM_TOP_N).iterrows():
         # Cast back to native Python types. Values read out of a DataFrame row are
         # numpy scalars, and xgboost's JSON parser rejects a numpy int for an

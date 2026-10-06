@@ -34,6 +34,7 @@ measurement we have.
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -82,8 +83,8 @@ PROPOSED_PARAMS = {
 
 
 def cross_validate_one(
-    features: pd.DataFrame, labels: pd.Series, params: dict[str, object], name: str
-) -> dict[str, object]:
+    features: pd.DataFrame, labels: pd.Series, params: dict[str, Any], name: str
+) -> dict[str, Any]:
     """Score one configuration across five stratified folds.
 
     Args:
@@ -166,7 +167,7 @@ def main() -> None:
     print("comparable with each other.")
     print()
 
-    results: list[dict[str, object]] = []
+    results: list[dict[str, Any]] = []
     for name, params in (
         ("shipped (config.yaml)", SHIPPED_PARAMS),
         ("proposed (2000 trees, depth 6)", PROPOSED_PARAMS),

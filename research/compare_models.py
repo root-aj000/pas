@@ -25,6 +25,7 @@ already here.
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 # Running this file as `python research/compare_models.py` puts research/ on the
 # import path, not the project root, so `import src...` fails. Adding the root
@@ -54,7 +55,7 @@ from src.utils.common import (
 #
 # The params are DEFAULT settings on purpose. .lead/02-C Step 7 requires every
 # candidate to be run once with defaults first.
-CANDIDATES: dict[str, dict[str, object]] = {
+CANDIDATES: dict[str, dict[str, Any]] = {
     "logistic_regression": {},
     "decision_tree": {},
     "random_forest": {},
@@ -75,7 +76,7 @@ BASELINES: list[tuple[str, float, float]] = [
 ]
 
 
-def build_xgboost(params: dict[str, object], seed: int):
+def build_xgboost(params: dict[str, Any], seed: int):
     """Create an XGBoost classifier, if xgboost is installed.
 
     Args:
@@ -105,7 +106,7 @@ def score_candidate(
     train_data: pd.DataFrame,
     validation_data: pd.DataFrame,
     seed: int,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Fit one candidate and score it on the validation split.
 
     Args:
@@ -190,7 +191,7 @@ def main() -> int:
     )
     logger.info("")
 
-    results: list[dict[str, object]] = []
+    results: list[dict[str, Any]] = []
     for name, params in CANDIDATES.items():
         model = build_model(name, params, seed)
         row = score_candidate(name, model, features, train_data, validation_data, seed)

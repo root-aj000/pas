@@ -28,6 +28,7 @@ it is not worth its dependencies.
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -225,7 +226,7 @@ def main() -> None:
     )
     print()
 
-    results: list[dict[str, object]] = []
+    results: list[dict[str, Any]] = []
     for name, hidden_sizes in ARCHITECTURES.items():
         seed_scores: list[float] = []
         started = time.monotonic()

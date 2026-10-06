@@ -17,6 +17,7 @@ list is unmaintainable, because nobody can say what it was trained on.
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, Protocol
 
 import cloudpickle
 import pandas as pd
@@ -47,8 +48,8 @@ from src.utils.common import (
 
 
 def add_encoding_parameter(
-    model_name: str, params: dict[str, object], categorical_encoding: str
-) -> dict[str, object]:
+    model_name: str, params: dict[str, Any], categorical_encoding: str
+) -> dict[str, Any]:
     """Return the parameters with the right categorical handling added.
 
     Args:
@@ -75,7 +76,7 @@ def add_encoding_parameter(
     return dict(params)
 
 
-def build_realmlp_classifier(**params: object):
+def build_realmlp_classifier(**params: Any):
     """Create a RealMLP_TD_Classifier, importing pytabkit only when asked for.
 
     Args:
@@ -104,7 +105,7 @@ def build_realmlp_classifier(**params: object):
     return RealMLP_TD_Classifier(**params)
 
 
-def build_xgboost_classifier(**params: object):
+def build_xgboost_classifier(**params: Any):
     """Create an XGBClassifier, importing xgboost only when it is asked for.
 
     Args:
@@ -143,7 +144,22 @@ def build_xgboost_classifier(**params: object):
 # - and it is allowed here for one specific proven reason: we compare several
 # methods before choosing one. See .lead/02-C-CHOOSING-THE-METHOD.md Step 7.
 # If the project ever uses only one model, delete this and instantiate it directly.
-MODEL_REGISTRY: dict[str, Callable[..., object]] = {
+class Estimator(Protocol):
+    """What every model in MODEL_REGISTRY must be able to do.
+
+    The registry holds six unrelated classes - four scikit-learn estimators,
+    XGBoost, and RealMLP. They share no base class, so this names the two
+    methods the pipeline actually calls on them. Declaring it means build_model
+    can promise a return type, and callers can use .fit() and .predict_proba()
+    without a type checker objecting that the attribute does not exist.
+    """
+
+    def fit(self, X: Any, y: Any, **kwargs: Any) -> Any: ...
+
+    def predict_proba(self, X: Any) -> Any: ...
+
+
+MODEL_REGISTRY: dict[str, Callable[..., "Estimator"]] = {
     "logistic_regression": LogisticRegression,
     "decision_tree": DecisionTreeClassifier,
     "random_forest": RandomForestClassifier,
@@ -174,7 +190,7 @@ MODELS_WITHOUT_RANDOM_STATE: frozenset[str] = frozenset({"decision_tree"})
 # tuned for 490,000 rows and cannot fit 16 by design - min_samples_leaf=40 is a
 # sensible production value and a fatal one on a 16-row dataset. Feeding it in
 # made this check fail on every run, which is the same as having no check.
-TINY_DATASET_OVERRIDES: dict[str, dict[str, object]] = {
+TINY_DATASET_OVERRIDES: dict[str, dict[str, Any]] = {
     "hist_gradient_boosting": {"min_samples_leaf": 1, "max_iter": 300},
     "random_forest": {"min_samples_leaf": 1, "n_estimators": 20},
     "logistic_regression": {"max_iter": 5000},
@@ -188,10 +204,10 @@ TINY_DATASET_OVERRIDES: dict[str, dict[str, object]] = {
 
 def build_model(
     model_name: str,
-    params: dict[str, object],
+    params: dict[str, Any],
     seed: int,
     categorical_encoding: str = "one_hot",
-):
+) -> "Estimator":
     """Create the model named in the configuration.
 
     Args:
@@ -260,7 +276,7 @@ def score_model(model, features: pd.DataFrame, target: pd.Series) -> dict[str, f
 
 def run_overfitting_check(
     model_name: str,
-    params: dict[str, object],
+    params: dict[str, Any],
     seed: int,
     categorical_encoding: str = "one_hot",
 ) -> bool:
@@ -324,7 +340,7 @@ def run_overfitting_check(
 def write_model_card(
     model_path: Path,
     model_name: str,
-    params: dict[str, object],
+    params: dict[str, Any],
     validation_metrics: dict[str, float],
     features: list[str],
     seed: int,

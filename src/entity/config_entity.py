@@ -10,6 +10,7 @@ See .lead/02-A-ARCHITECTURE.md section 2.
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class ModelTrainerConfig:
     train_data_path: Path
     model_dir: Path
     model_name: str
-    model_params: dict[str, object]
+    model_params: dict[str, Any]
     features: list[str]
     target_column: str
     random_seed: int

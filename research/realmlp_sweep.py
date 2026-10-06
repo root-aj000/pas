@@ -19,6 +19,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -100,7 +101,7 @@ def load_frames(features: list[str], target: str) -> tuple[pd.DataFrame, pd.Seri
     return frame[features], frame[target]
 
 
-def build_model(kind: str, params: dict[str, object], seed: int):
+def build_model(kind: str, params: dict[str, Any], seed: int):
     """Create one unfitted estimator.
 
     Args:
@@ -132,7 +133,7 @@ def build_model(kind: str, params: dict[str, object], seed: int):
 
 def cross_validate(
     kind: str,
-    params: dict[str, object],
+    params: dict[str, Any],
     X: pd.DataFrame,
     y: pd.Series,
     folds: int,
@@ -205,7 +206,7 @@ def main() -> None:
         flush=True,
     )
 
-    presets: dict[str, dict[str, object]] = {
+    presets: dict[str, dict[str, Any]] = {
         "base": {"n_ens": args.members, "n_epochs": args.epochs, "device": "cpu"},
         "tuned": {
             "n_ens": args.members,

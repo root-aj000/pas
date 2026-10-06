@@ -7,6 +7,8 @@ The tests use small readable tables written inline, not the real data. See
 .dev/RULES.md rule 10: "Test data is small and readable."
 """
 
+from typing import Any
+
 import pandas as pd
 import pytest
 
@@ -29,7 +31,7 @@ def make_small_frame(rows: int = 5) -> pd.DataFrame:
     Returns:
         A frame with all service ratings at 3, and both delay columns at 0.
     """
-    data: dict[str, object] = {"id": list(range(rows)), "satisfaction": [True] * rows}
+    data: dict[str, Any] = {"id": list(range(rows)), "satisfaction": [True] * rows}
     for column in SERVICE_RATING_COLUMNS:
         data[column] = [3] * rows
     data["Age"] = [40] * rows

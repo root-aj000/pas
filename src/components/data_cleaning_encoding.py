@@ -20,6 +20,8 @@ no passenger identifier, so there is no time axis to cut on and no entity to hol
 out. The reasoning is written down in docs/split_plan.md.
 """
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -703,7 +705,7 @@ def fit_auxiliary_models(
     rating_columns: list[str],
     categories: dict[str, list[str]],
     seed: int,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Fit one small model per auxiliary target, predicting it from the rest.
 
     Args:
@@ -726,7 +728,7 @@ def fit_auxiliary_models(
     from xgboost import XGBClassifier
 
     coded = _aux_codes(train_frame, categories)
-    models: dict[str, object] = {}
+    models: dict[str, Any] = {}
     for column in AUX_TARGETS:
         inputs = [c for c in CANDIDATE_FEATURE_COLUMNS if c != column]
         codes, _ = _aux_codes_and_values(coded[column])
@@ -750,7 +752,7 @@ def fit_auxiliary_models(
 
 def apply_auxiliary_features(
     frame: pd.DataFrame,
-    aux_models: dict[str, object],
+    aux_models: dict[str, Any],
     rating_columns: list[str],
     categories: dict[str, list[str]],
     precomputed: pd.DataFrame | None,

@@ -27,6 +27,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -121,7 +122,7 @@ LGB_GPU = {
 }
 
 
-def build_roster(members: int, epochs: int, device: str) -> dict[str, dict[str, object]]:
+def build_roster(members: int, epochs: int, device: str) -> dict[str, dict[str, Any]]:
     """Return the candidate roster.
 
     Args:
@@ -166,12 +167,19 @@ def build_roster(members: int, epochs: int, device: str) -> dict[str, dict[str, 
             "params": {"max_epochs": epochs, "device": device},
         },
         "xrfr": {"kind": "xrfr", "params": {"device": device}},
-        "xgboost": {"kind": "xgboost", "params": dict(XGB_GPU if device == "cuda" else XGB_CPU)},
-        "lightgbm": {"kind": "lightgbm", "params": dict(LGB_GPU if device == "cuda" else LGB_CPU)},
+        "xgboost": {
+            "kind": "xgboost",
+            "params": dict(XGB_GPU if device == "cuda" else XGB_CPU),
+        },
+        "lightgbm": {
+            "kind": "lightgbm",
+            "params": dict(LGB_GPU if device == "cuda" else LGB_CPU),
+        },
+        "tabnet": {"kind": "tabnet", "params": {"device": device}},
     }
 
 
-def build_estimator(kind: str, params: dict[str, object], seed: int):
+def build_estimator(kind: str, params: dict[str, Any], seed: int):
     """Create one unfitted estimator of the requested family.
 
     Args:
@@ -218,6 +226,14 @@ def build_estimator(kind: str, params: dict[str, object], seed: int):
         from lightgbm import LGBMClassifier
 
         return LGBMClassifier(**params, random_state=seed, verbosity=-1)
+    if kind == "tabnet":
+        from pytorch_tabnet.tab_model import TabNetClassifier
+
+        return TabNetClassifier(
+            verbose=0,
+            seed=seed + 1,
+            device_name="cuda" if params.get("device") == "cuda" else "cpu",
+        )
     raise ValueError(f"unknown kind: {kind}")
 
 
@@ -239,6 +255,37 @@ def fit_one(estimator, X: pd.DataFrame, y: pd.Series, categorical: list[str]):
     keyword and falling back is less code than branching per family, and it fails
     loudly if some family's signature is neither.
     """
+    from pytorch_tabnet.tab_model import TabNetClassifier
+
+    if isinstance(estimator, TabNetClassifier):
+        import numpy as np
+
+        frame = X.copy()
+        cat_positions, cat_sizes = [], []
+        for position, column in enumerate(frame.columns):
+            if column in categorical or str(frame[column].dtype) == "category":
+                codes, uniques = pd.factorize(frame[column])
+                frame[column] = codes
+                cat_positions.append(position)
+                cat_sizes.append(len(uniques))
+        for column in frame.columns:
+            if frame[column].dtype == object:
+                frame[column] = pd.factorize(frame[column])[0]
+        Xn = frame.to_numpy(dtype=np.float32)
+        yn = y.to_numpy()
+        # cat_idxs/cat_dims are constructor-only in this pytorch-tabnet build,
+        # so the estimator is rebuilt here where the columns are known. The seed
+        # and device come from the placeholder build_estimator made.
+        fresh = TabNetClassifier(
+            verbose=0,
+            seed=getattr(estimator, "seed", 42),
+            device_name=getattr(estimator, "device_name", "cpu"),
+            cat_idxs=cat_positions,
+            cat_dims=cat_sizes,
+            cat_emb_dim=1,
+        )
+        fresh.fit(Xn, yn, patience=3, max_epochs=20, batch_size=4096)
+        return fresh
     try:
         estimator.fit(X, y, cat_col_names=categorical)
     except TypeError:
@@ -269,7 +316,10 @@ def load_frame(
     frame = pd.read_csv(
         path,
         usecols=columns,
-        dtype={**{c: "float32" for c in numeric}, **({target: "int8"} if target else {})},
+        dtype={
+            **{c: "float32" for c in numeric},
+            **({target: "int8"} if target else {}),
+        },
         low_memory=False,
     )
     for column in categorical:
@@ -277,17 +327,43 @@ def load_frame(
     return frame
 
 
+def _predict(estimator, frame: pd.DataFrame) -> np.ndarray:
+    """Predict probabilities, encoding the frame the way TabNet was fitted.
+
+    Args:
+        estimator: The fitted estimator.
+        frame: Rows to score.
+
+    Returns:
+        The positive-class probabilities.
+    """
+    from pytorch_tabnet.tab_model import TabNetClassifier
+
+    if isinstance(estimator, TabNetClassifier):
+        import numpy as np
+
+        encoded = frame.copy()
+        for column in encoded.columns:
+            if (
+                str(encoded[column].dtype) == "category"
+                or encoded[column].dtype == object
+            ):
+                encoded[column] = pd.Categorical(encoded[column]).codes
+        return estimator.predict_proba(encoded.to_numpy(dtype=np.float32))[:, 1]
+    return estimator.predict_proba(frame)[:, 1]
+
+
 def run_member(
     name: str,
     kind: str,
-    params: dict[str, object],
+    params: dict[str, Any],
     X: pd.DataFrame,
     y: pd.Series,
     Xc: pd.DataFrame,
     categorical: list[str],
     folds: int,
     seed: int,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Cross-validate one member and write its predictions.
 
     Args:
@@ -315,8 +391,8 @@ def run_member(
             y.iloc[fit_index],
             categorical,
         )
-        oof[score_index] = estimator.predict_proba(X.iloc[score_index])[:, 1]
-        test += estimator.predict_proba(Xc)[:, 1] / folds
+        oof[score_index] = _predict(estimator, X.iloc[score_index])
+        test += _predict(estimator, Xc) / folds
         del estimator
         print(
             f"  {name} fold {fold + 1}/{folds} done ({time.time() - started:.0f}s)",
@@ -346,8 +422,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--suffix", default="", help="appended to output filenames")
     parser.add_argument("--device", default="cpu", help="'cpu' or 'cuda'")
-    parser.add_argument("--artifacts", default=str(DEFAULT_ARTIFACTS),
-                        help="directory holding train.csv and competition_test.csv")
+    parser.add_argument(
+        "--artifacts",
+        default=str(DEFAULT_ARTIFACTS),
+        help="directory holding train.csv and competition_test.csv",
+    )
     parser.add_argument(
         "--drop-prefix",
         default="",

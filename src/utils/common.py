@@ -165,15 +165,16 @@ def get_logger(name: str = LOGGER_NAME) -> logging.Logger:
 def log_step(
     step: str,
     rows_in: int | None = None,
-    rows_out: int | None = None,
-    **details: object,
+    rows_out: Any = None,
+    **details: Any,
 ) -> None:
     """Log one pipeline step: what it took in, what it did, what it produced.
 
     Args:
         step: Short name of the step, for example "clean".
         rows_in: Row count before the step, or None if not applicable.
-        rows_out: Row count after the step, or None if not applicable.
+        rows_out: Row count after the step, or None if not applicable. Any, not
+            int, because callers also pass numpy integer counts.
         **details: Any other facts worth logging, for example dropped=412.
 
     Example:
@@ -334,7 +335,7 @@ def log_run_header(command: str, config_path: Path, seed: int) -> None:
 
 
 def log_run_footer(
-    status: str, exit_code: int, duration_seconds: float, **facts: object
+    status: str, exit_code: int, duration_seconds: float, **facts: Any
 ) -> None:
     """Log how the run ended.
 

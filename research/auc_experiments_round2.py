@@ -21,6 +21,7 @@ Validation split only. The test split stays closed.
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -103,8 +104,8 @@ def main() -> None:
     validation_data = pd.read_csv("artifacts/data_cleaning_encoding/validation.csv")
     features = BASE_FEATURES
 
-    results: list[dict[str, object]] = []
-    keep_probabilities: dict[str, object] = {}
+    results: list[dict[str, Any]] = []
+    keep_probabilities: dict[str, Any] = {}
 
     def record(label: str, family: str, auc: float, seconds: float) -> None:
         """Store one result row."""
@@ -121,7 +122,7 @@ def main() -> None:
     print("COMBINING THE ROUND 1 WINNERS - capacity up, learning rate down")
     print("=" * 92)
 
-    hist_candidates: list[tuple[str, dict[str, object]]] = [
+    hist_candidates: list[tuple[str, dict[str, Any]]] = [
         (
             "baseline (shipped): leaf=40, leaves=31, iter=400, lr=0.06",
             {
@@ -214,7 +215,7 @@ def main() -> None:
     print("XGBoost WITH MORE CAPACITY - it won round 1 at defaults by 0.0010")
     print("=" * 92)
 
-    xgb_candidates: list[tuple[str, dict[str, object]]] = [
+    xgb_candidates: list[tuple[str, dict[str, Any]]] = [
         ("xgboost defaults", {}),
         (
             "xgboost depth 6, 600 trees, lr 0.05",
