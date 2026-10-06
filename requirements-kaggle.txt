@@ -8,3 +8,9 @@
 # Install ONLY what Kaggle does not ship:
 pytabkit
 optuna-integration[xgboost]
+# Model-zoo members (research/make_members.py, make_tabular_members.py).
+# pytabkit imports these lazily, so a missing one only fails at fit time.
+skorch
+xrfm
+pytorch-tabular
+pytorch-tabnet

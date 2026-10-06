@@ -34,7 +34,7 @@ import yaml
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-ARTIFACTS = Path("artifacts/data_cleaning_encoding")
+DEFAULT_ARTIFACTS = Path("artifacts/data_cleaning_encoding")
 OUT_DIR = Path("research/members")
 
 # The tuned RealMLP recipe, verbatim from the reference notebook's REALMLP dict.
@@ -76,7 +76,7 @@ TUNED = {
     ],
 }
 
-XGB = {
+XGB_CPU = {
     "n_estimators": 1200,
     "learning_rate": 0.05,
     "max_depth": 8,
@@ -88,8 +88,20 @@ XGB = {
     "tree_method": "hist",
     "n_jobs": 8,
 }
+XGB_GPU = {
+    "n_estimators": 1200,
+    "learning_rate": 0.05,
+    "max_depth": 8,
+    "min_child_weight": 5e-6,
+    "reg_lambda": 0.0,
+    "max_bin": 256,
+    "subsample": 0.65,
+    "colsample_bylevel": 0.9,
+    "tree_method": "hist",
+    "device": "cuda",
+}
 
-LGB = {
+LGB_CPU = {
     "n_estimators": 1000,
     "learning_rate": 0.05,
     "num_leaves": 100,
@@ -98,9 +110,18 @@ LGB = {
     "colsample_bytree": 0.7,
     "n_jobs": 8,
 }
+LGB_GPU = {
+    "n_estimators": 1000,
+    "learning_rate": 0.05,
+    "num_leaves": 100,
+    "max_bin": 255,
+    "subsample": 0.7,
+    "colsample_bytree": 0.7,
+    "device": "gpu",
+}
 
 
-def build_roster(members: int, epochs: int) -> dict[str, dict[str, object]]:
+def build_roster(members: int, epochs: int, device: str) -> dict[str, dict[str, object]]:
     """Return the candidate roster.
 
     Args:
@@ -108,6 +129,7 @@ def build_roster(members: int, epochs: int) -> dict[str, dict[str, object]]:
             going from 8 to 16 members at +0.00002, so screening uses a small
             number and only the finalists get the full one.
         epochs: Epochs for the neural members.
+        device: "cpu" or "cuda", passed straight to every estimator.
 
     Returns:
         Member name to {"kind": ..., "params": {...}}.
@@ -127,29 +149,25 @@ def build_roster(members: int, epochs: int) -> dict[str, dict[str, object]]:
     return {
         "realmlp_tuned": {
             "kind": "realmlp",
-            "params": {"n_ens": members, "n_epochs": epochs, "device": "cpu", **TUNED},
+            "params": {"n_ens": members, "n_epochs": epochs, "device": device, **TUNED},
         },
-        "tabm": {"kind": "tabm", "params": {"n_epochs": epochs, "device": "cpu"}},
-        "ftt": {"kind": "ftt", "params": {"max_epochs": epochs, "device": "cpu"}},
-        "realtabr": {
-            "kind": "realtabr",
-            "params": {"n_epochs": epochs, "device": "cpu"},
-        },
+        "tabm": {"kind": "tabm", "params": {"n_epochs": epochs, "device": device}},
+        "ftt": {"kind": "ftt", "params": {"max_epochs": epochs, "device": device}},
         "mlp_plr": {
             "kind": "mlp_plr",
-            "params": {"max_epochs": epochs, "device": "cpu"},
+            "params": {"max_epochs": epochs, "device": device},
         },
         "mlp_rtdl": {
             "kind": "mlp_rtdl",
-            "params": {"max_epochs": epochs, "device": "cpu"},
+            "params": {"max_epochs": epochs, "device": device},
         },
         "resnet_rtdl": {
             "kind": "resnet_rtdl",
-            "params": {"max_epochs": epochs, "device": "cpu"},
+            "params": {"max_epochs": epochs, "device": device},
         },
-        "xrfr": {"kind": "xrfr", "params": {"device": "cpu"}},
-        "xgboost": {"kind": "xgboost", "params": dict(XGB)},
-        "lightgbm": {"kind": "lightgbm", "params": dict(LGB)},
+        "xrfr": {"kind": "xrfr", "params": {"device": device}},
+        "xgboost": {"kind": "xgboost", "params": dict(XGB_GPU if device == "cuda" else XGB_CPU)},
+        "lightgbm": {"kind": "lightgbm", "params": dict(LGB_GPU if device == "cuda" else LGB_CPU)},
     }
 
 
@@ -176,10 +194,6 @@ def build_estimator(kind: str, params: dict[str, object], seed: int):
         from pytabkit import FTT_D_Classifier
 
         return FTT_D_Classifier(**params, random_state=seed)
-    if kind == "realtabr":
-        from pytabkit import RealTabR_D_Classifier
-
-        return RealTabR_D_Classifier(**params, random_state=seed)
     if kind == "mlp_plr":
         from pytabkit import MLP_PLR_D_Classifier
 
@@ -328,9 +342,12 @@ def main() -> None:
     parser.add_argument("--only", required=True, help="comma-separated member names")
     parser.add_argument("--members", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=4)
-    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--folds", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--suffix", default="", help="appended to output filenames")
+    parser.add_argument("--device", default="cpu", help="'cpu' or 'cuda'")
+    parser.add_argument("--artifacts", default=str(DEFAULT_ARTIFACTS),
+                        help="directory holding train.csv and competition_test.csv")
     parser.add_argument(
         "--drop-prefix",
         default="",
@@ -352,11 +369,12 @@ def main() -> None:
     ]
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    roster = build_roster(args.members, args.epochs)
+    roster = build_roster(args.members, args.epochs, args.device)
 
     print(f"loading {len(features)} features from the stage-2 artifacts", flush=True)
-    X = load_frame(ARTIFACTS / "train.csv", features, target, categorical)
-    Xc = load_frame(ARTIFACTS / "competition_test.csv", features, None, categorical)
+    artifacts = Path(args.artifacts)
+    X = load_frame(artifacts / "train.csv", features, target, categorical)
+    Xc = load_frame(artifacts / "competition_test.csv", features, None, categorical)
     y = X[target].astype("int8")
     X = X.drop(columns=[target])
     print(f"train {X.shape} competition {Xc.shape}", flush=True)

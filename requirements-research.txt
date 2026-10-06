@@ -10,4 +10,5 @@
 # Not needed by run_pipeline.py, which only uses RealMLP_TD_Classifier.
 # Install with: uv pip install -r requirements-research.txt
 skorch
-xrfm
+xrfmpytorch-tabular
+pytorch-tabnet

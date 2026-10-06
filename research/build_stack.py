@@ -29,7 +29,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-MEMBERS = Path("research/members")
+DEFAULT_MEMBERS = Path("research/members")
+DEFAULT_ARTIFACTS = Path("artifacts/data_cleaning_encoding")
 SPLIT_SEED = 7
 
 
@@ -46,10 +47,13 @@ def logit(p: np.ndarray) -> np.ndarray:
     return np.log(clipped / (1 - clipped))
 
 
-def load_members(names: list[str] | None) -> tuple[list[str], np.ndarray, np.ndarray]:
+def load_members(
+    members_dir: Path, names: list[str] | None
+) -> tuple[list[str], np.ndarray, np.ndarray]:
     """Read each member's out-of-fold and test predictions from disk.
 
     Args:
+        members_dir: Directory holding the oof_*.npy and test_*.npy files.
         names: Member names to load, or None for every member present.
 
     Returns:
@@ -57,17 +61,21 @@ def load_members(names: list[str] | None) -> tuple[list[str], np.ndarray, np.nda
         and the matching test matrix.
     """
     if names is None:
-        names = sorted(p.stem[4:] for p in MEMBERS.glob("oof_*.npy"))
+        names = sorted(p.stem[4:] for p in members_dir.glob("oof_*.npy"))
     missing = [
         n
         for n in names
-        if not (MEMBERS / f"oof_{n}.npy").exists()
-        or not (MEMBERS / f"test_{n}.npy").exists()
+        if not (members_dir / f"oof_{n}.npy").exists()
+        or not (members_dir / f"test_{n}.npy").exists()
     ]
     if missing:
         raise SystemExit(f"missing predictions for: {missing}")
-    oof = np.column_stack([logit(np.load(MEMBERS / f"oof_{n}.npy")) for n in names])
-    test = np.column_stack([logit(np.load(MEMBERS / f"test_{n}.npy")) for n in names])
+    oof = np.column_stack(
+        [logit(np.load(members_dir / f"oof_{n}.npy")) for n in names]
+    )
+    test = np.column_stack(
+        [logit(np.load(members_dir / f"test_{n}.npy")) for n in names]
+    )
     return names, oof, test
 
 
@@ -138,14 +146,18 @@ def main() -> None:
     parser.add_argument("--out", default="reports/submissions/submission_stack.csv")
     parser.add_argument("--max-members", type=int, default=12)
     parser.add_argument("--no-submission", action="store_true")
+    parser.add_argument("--members-dir", default=str(DEFAULT_MEMBERS))
+    parser.add_argument("--artifacts", default=str(DEFAULT_ARTIFACTS))
     args = parser.parse_args()
 
+    members_dir = Path(args.members_dir)
+    artifacts = Path(args.artifacts)
     names = args.members.split(",") if args.members else None
-    names, Z, test_Z = load_members(names)
+    names, Z, test_Z = load_members(members_dir, names)
 
-    y = pd.read_csv(
-        "artifacts/data_cleaning_encoding/train.csv", usecols=["satisfaction"]
-    )["satisfaction"].to_numpy()
+    y = pd.read_csv(artifacts / "train.csv", usecols=["satisfaction"])[
+        "satisfaction"
+    ].to_numpy()
 
     print("=== members, scored out-of-fold on the training rows ===")
     solo = []
@@ -177,9 +189,7 @@ def main() -> None:
 
     final = LogisticRegression(C=1.0, max_iter=1000).fit(Z, y)
     prediction = 1 / (1 + np.exp(-final.decision_function(test_Z)))
-    competition = pd.read_csv(
-        "artifacts/data_cleaning_encoding/competition_test.csv", usecols=["id"]
-    )
+    competition = pd.read_csv(artifacts / "competition_test.csv", usecols=["id"])
     submission = pd.DataFrame(
         {"id": competition["id"].values, "satisfaction": prediction}
     )
@@ -193,7 +203,7 @@ def main() -> None:
     ):
         print(f"  {name:22s} {weight:+.4f}")
     print(f"\nwrote {out_path}  rows={len(submission)}")
-    Path("research/members/stack_meta.json").write_text(
+    (members_dir / "stack_meta.json").write_text(
         json.dumps(
             {
                 "members": names,
