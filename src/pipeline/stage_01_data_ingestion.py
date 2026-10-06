@@ -10,7 +10,7 @@ See .lead/02-A-ARCHITECTURE.md section 5.
 
 from src.components.data_ingestion import run_data_ingestion
 from src.config.configuration import PipelineConfigReader
-from src.utils.common import get_logger, log_step
+from src.utils.common import get_logger, log_step, setup_logging
 
 STAGE_NAME = "stage_01_data_ingestion"
 
@@ -23,6 +23,7 @@ def run_pipeline() -> None:
         ValueError: If the data is empty, a column is missing, a rating is out of
             range, an id repeats, or a column is mostly blank.
     """
+    setup_logging()
     logger = get_logger()
     logger.info("[%s] starting data ingestion", STAGE_NAME)
 

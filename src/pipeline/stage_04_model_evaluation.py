@@ -11,7 +11,7 @@ src/components/model_evaluation.py. See .lead/02-A-ARCHITECTURE.md section 5.
 
 from src.components.model_evaluation import run_model_evaluation
 from src.config.configuration import PipelineConfigReader
-from src.utils.common import get_logger, log_step, next_model_version
+from src.utils.common import get_logger, log_step, next_model_version, setup_logging
 
 STAGE_NAME = "stage_04_model_evaluation"
 
@@ -33,6 +33,7 @@ def run_pipeline(model_version: int | None = None):
         ValueError: If the saved feature list does not match the prepared data, or
             the submission row count does not match the template.
     """
+    setup_logging()
     logger = get_logger()
     logger.info("[%s] starting model evaluation", STAGE_NAME)
 

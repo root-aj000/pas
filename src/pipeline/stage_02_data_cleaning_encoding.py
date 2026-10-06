@@ -10,7 +10,7 @@ See .lead/02-A-ARCHITECTURE.md section 5.
 
 from src.components.data_cleaning_encoding import run_data_cleaning_encoding
 from src.config.configuration import PipelineConfigReader
-from src.utils.common import get_logger, log_step
+from src.utils.common import get_logger, log_step, setup_logging
 
 STAGE_NAME = "stage_02_data_cleaning_encoding"
 
@@ -23,6 +23,7 @@ def run_pipeline() -> None:
         ValueError: If the split is degenerate, the base rates diverge, or the
             feature list does not match the data.
     """
+    setup_logging()
     logger = get_logger()
     logger.info("[%s] starting data cleaning and encoding", STAGE_NAME)
 
