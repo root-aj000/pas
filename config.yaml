@@ -149,46 +149,10 @@ features:
   - "te_FD|Type o"
   - "te_Age|Class|Type o|Custom"
 
-  # The 30 auxiliary-task columns, from the reference recipe. 16 aux_p_ (the
-  # model's probability of the row's own value), 13 aux_ev_ (its expected
-  # value for that rating), and aux_sum_logp. Predicted from the other 20
-  # RAW columns only - the reference measured twelve variants and every one
-  # that also saw the route profile or the target encodings was worse than
-  # having nothing. Train rows are scored out-of-fold.
-  - "aux_p_Inflight wifi service"
-  - "aux_p_Departure/Arrival time convenient"
-  - "aux_p_Ease of Online booking"
-  - "aux_p_Gate location"
-  - "aux_p_Food and drink"
-  - "aux_p_Online boarding"
-  - "aux_p_Seat comfort"
-  - "aux_p_Inflight entertainment"
-  - "aux_p_On-board service"
-  - "aux_p_Leg room service"
-  - "aux_p_Baggage handling"
-  - "aux_p_Checkin service"
-  - "aux_p_Cleanliness"
-  - "aux_p_Class"
-  - "aux_p_Type of Travel"
-  - "aux_p_Customer Type"
-  - "aux_ev_Inflight wifi service"
-  - "aux_ev_Departure/Arrival time convenient"
-  - "aux_ev_Ease of Online booking"
-  - "aux_ev_Gate location"
-  - "aux_ev_Food and drink"
-  - "aux_ev_Online boarding"
-  - "aux_ev_Seat comfort"
-  - "aux_ev_Inflight entertainment"
-  - "aux_ev_On-board service"
-  - "aux_ev_Leg room service"
-  - "aux_ev_Baggage handling"
-  - "aux_ev_Checkin service"
-  - "aux_ev_Cleanliness"
-  - "aux_sum_logp"
 
-  # How often each numeric value occurs in the train split. Label-free.
-  # Flight Distance has 3,474 distinct values, so route frequency is real
-  # signal. Reference measured +0.00007 on top of route profile + encodings.
+  # Aux columns removed 2026-10-06: 5-fold OOF showed aux hurts RealMLP
+  # by -0.000275 (0.959576 with vs 0.959851 without, noise ~0.00005).
+  # The reference's aux helped their setup; ours is noise here. See run 31.
   - "cnt_Age"
   - "cnt_Flight Distance"
   - "cnt_Departure Delay in Minutes"
@@ -281,7 +245,7 @@ route_features:
 # for train rows, full-train models everywhere else. No label is used as an
 # input - each rating is predicted from the other 20 columns only.
 auxiliary_features:
-  enabled: true
+  enabled: false
 
 # --- Categorical twins (v4 inputs) ---------------------------------------------
 # Every numeric column gets a categorical twin: the value as an integer, then as
