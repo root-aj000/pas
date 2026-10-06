@@ -13,9 +13,10 @@ of work - every member is cross-validated, and the combiner is fitted on those
 out-of-fold predictions. Folding it into stage 3 would change that stage's
 contract and its tests for no benefit.
 
-The test split is not read here. This stage predicts only the competition rows,
-and every number it reports is measured on the training rows out of fold. The
-validation split *is* read, and folded into training - see `run_pipeline`.
+The frozen test split is not held back from training: this stage cross-validates
+internally, so it needs no split of its own and folds train, validation and test
+into the training rows. Every number it reports is measured out of fold. See
+`load_ensemble_frames`.
 """
 
 from src.components.ensemble import load_ensemble_frames, train_ensemble
@@ -52,9 +53,9 @@ def run_pipeline() -> str | None:
     features = list(pipeline.training.features)
     categorical = [c for c in cleaning.categorical_columns if c in features]
 
-    # The frame assembly - including folding the validation split back into
-    # training - lives in the components layer because the per-GPU workers have to
-    # build exactly the same frames.
+    # The frame assembly - including folding the validation and test splits back
+    # into training - lives in the components layer because the per-GPU workers
+    # have to build exactly the same frames.
     train_frame, competition_frame = load_ensemble_frames(
         pipeline.artifacts_root / "data_cleaning_encoding", features, categorical
     )

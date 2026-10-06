@@ -24,6 +24,7 @@ train on different rows from the stack.
 import argparse
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from src.components.ensemble import (
@@ -80,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     device = resolve_device(config.device)
+    # Same reason as the parent: `train_member` reads `config.device`, so the
+    # resolved value has to go back into the config, not just into the log line.
+    config = replace(config, device=device)
     log_step(
         "gpu_shard_start",
         members=len(wanted),

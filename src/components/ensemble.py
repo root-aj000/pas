@@ -38,7 +38,7 @@ Two failure modes this module exists to prevent, both of which happened:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -186,16 +186,23 @@ def load_ensemble_frames(
         ValueError: If the training frame carries two columns of the same name.
 
     Note:
-    The validation split is folded into training. Stage 2 splits 70/15/15 for the
-    single-model path, where the validation file gave stages 3 and 4 something to
-    early-stop and select on. The ensemble cross-validates internally and needs
-    no held-out split of its own, so reading only train.csv threw away 15% of the
-    labelled rows - 489,743 instead of 699,635 - for every member.
+    All three labelled splits are folded into training - train, validation and
+    the frozen test split. Stage 2 splits 70/15/15 for the single-model path,
+    where the validation file gave stages 3 and 4 something to early-stop and
+    select on and the test file gave stage 4 something to report a final number
+    against. The ensemble cross-validates internally and reads neither, so both
+    were pure loss: reading only train.csv trained every member on 489,743 of the
+    699,635 labelled rows, and a first fix that added validation still left
+    104,946 behind at 594,689.
 
-    Safe to concatenate: stage 2 encoded both files in one pass, with identical
+    Safe to concatenate: stage 2 encoded all three in one pass, with identical
     columns and the same train-fitted statistics, and its label-based columns were
-    cross-fitted, so a validation row's encoding never used its own label. The
-    fold structure that matters is created by the caller.
+    cross-fitted, so no row's encoding used its own label. The fold structure that
+    matters is created by the caller.
+
+    Nothing is lost as an evaluation set by this: `nested_stack_auc` scores every
+    row from a combiner fitted on other rows, which is the same guarantee the
+    frozen split was there to provide.
 
     This lives here rather than in the stage because the per-GPU workers have to
     build exactly the same frames, and two copies of a frame loader is how a
@@ -205,8 +212,9 @@ def load_ensemble_frames(
 
     train_path = artifacts_dir / "train.csv"
     validation_path = artifacts_dir / "validation.csv"
+    test_path = artifacts_dir / "test.csv"
     competition_path = artifacts_dir / "competition_test.csv"
-    for path in (train_path, validation_path, competition_path):
+    for path in (train_path, validation_path, test_path, competition_path):
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} not found. Run stage 2 first: python -m "
@@ -223,7 +231,8 @@ def load_ensemble_frames(
 
     train_only = read(train_path, "ensemble_train")
     validation = read(validation_path, "ensemble_train")
-    train_frame = pd.concat([train_only, validation], ignore_index=True)
+    test_split = read(test_path, "ensemble_train")
+    train_frame = pd.concat([train_only, validation, test_split], ignore_index=True)
     if train_frame.columns.duplicated().any():
         duplicated = sorted(set(train_frame.columns[train_frame.columns.duplicated()]))
         raise ValueError(
@@ -236,6 +245,7 @@ def load_ensemble_frames(
         rows=len(train_frame),
         train_rows=len(train_only),
         validation_rows=len(validation),
+        test_split_rows=len(test_split),
         competition_rows=len(competition_frame),
     )
     return train_frame, competition_frame
@@ -340,12 +350,20 @@ def apply_device(kind: str, params: dict[str, Any], device: str) -> dict[str, An
     Args:
         kind: Family name.
         params: The member's configured params.
-        device: "cpu" or "cuda", from `ensemble.device` in config.yaml.
+        device: "cpu" or "cuda". Must already be resolved by `resolve_device`.
 
     Returns:
         A copy of params carrying the right key for that family. On "cpu" the
         params are returned untouched, so a member that names its own device in
         config.yaml can still opt into the GPU on a CPU-configured run.
+
+    Raises:
+        ValueError: If `device` is neither "cpu" nor "cuda". This guard exists
+            because the alternative was silent: `ensemble.device: auto` reached
+            this function unresolved, so no family got a device param, none of
+            them defaults to the GPU, and a Kaggle run trained all nine members on
+            the processor while reporting no error and looking like it had
+            sharded across two cards.
 
     Note:
     Every family spells it differently - XGBoost wants `device="cuda"`,
@@ -355,6 +373,12 @@ def apply_device(kind: str, params: dict[str, Any], device: str) -> dict[str, An
     the nine members were built with no device at all and a Kaggle run trained
     the whole ensemble on CPU.
     """
+    if device not in ("cpu", "cuda"):
+        raise ValueError(
+            f"device must be 'cpu' or 'cuda', got {device!r}. If it came from "
+            f"config.yaml it was not resolved - call resolve_device() first. An "
+            f"unresolved 'auto' trains everything on CPU without complaining."
+        )
     out = dict(params)
     if device != "cuda":
         return out
@@ -991,6 +1015,13 @@ def train_ensemble(
     names: list[str] = []
 
     device = resolve_device(config.device)
+    # Write the resolved device back into the config. `train_member` reads
+    # `config.device` to hand to `apply_device`, and that call is what actually
+    # puts `device="cuda"` on an estimator. Resolving into a local for the
+    # sharding decision only - which is what happened first - left the members
+    # reading the raw "auto", so no member got a device and all nine trained on
+    # the processor.
+    config = replace(config, device=device)
     groups = plan_gpu_shards(config.members, device)
     if len(groups) > 1:
         # One worker process per GPU. They write the same .npy files the inline

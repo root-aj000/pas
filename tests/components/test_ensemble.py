@@ -503,3 +503,83 @@ def test_routediff_has_no_missing_values_when_the_delay_is_absent() -> None:
     assert residual.notna().all(), (
         f"{int(residual.isna().sum())} residuals are NaN where the delay is missing"
     )
+
+
+def test_apply_device_rejects_an_unresolved_device() -> None:
+    """An unresolved `auto` must raise, not silently leave members on the CPU.
+
+    This is the exact bug that cost a Kaggle session: `train_ensemble` resolved
+    `auto` into a local for the sharding decision, but `train_member` reads
+    `config.device` and that was still "auto". `apply_device` treated anything
+    that was not literally "cuda" as cpu, so no member received a device param,
+    every family defaults to the processor, and the run reported `gpus=2` while
+    both cards sat at 0%. Rejecting the value turns that into a loud failure.
+    """
+    from src.components.ensemble import apply_device
+
+    for unresolved in ("auto", "gpu", "", "GPU", "cuda:0"):
+        with pytest.raises(ValueError, match="resolve_device"):
+            apply_device("xgboost", {}, unresolved)
+
+
+def test_auto_device_is_written_back_into_the_config(monkeypatch) -> None:
+    """The resolved device must reach `config.device`, not just a local.
+
+    `train_member` reads `config.device` when it calls `apply_device`. Resolving
+    `auto` for the sharding decision alone leaves that read unresolved, so the
+    fix has to be `replace(config, device=device)` - the same call the parent and
+    the per-GPU worker both make.
+    """
+    from dataclasses import replace
+
+    import torch
+
+    from src.components.ensemble import EnsembleConfig, apply_device, resolve_device
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    config = EnsembleConfig(device="auto")
+    device = resolve_device(config.device)
+    assert device == "cuda"
+    resolved = replace(config, device=device)
+    assert resolved.device == "cuda"
+    assert apply_device("xgboost", {}, resolved.device).get("device") == "cuda"
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert resolve_device("auto") == "cpu"
+
+
+def test_load_ensemble_frames_uses_every_labelled_split(tmp_path) -> None:
+    """Stage 5 must train on all three labelled splits, not just `train.csv`.
+
+    Stage 2 splits 70/15/15 for the single-model path. The ensemble reads neither
+    the validation file nor the frozen test file, so holding them out was pure
+    loss: 489,743 rows first, then 594,689 after adding validation only. The
+    reference fits on all 699,635.
+
+    The fixture writes three labelled files plus the competition file, so the
+    assertion is on the row count rather than on the source.
+    """
+    import json
+
+    import src.utils.common as common
+    from src.components.ensemble import load_ensemble_frames
+
+    def write(name: str, rows: int, label: bool) -> None:
+        frame = pd.DataFrame({"Age": np.arange(rows, dtype=np.float64)})
+        if label:
+            frame["satisfaction"] = np.arange(rows) % 2
+        frame.to_csv(tmp_path / name, index=False)
+
+    write("train.csv", 70, True)
+    write("validation.csv", 15, True)
+    write("test.csv", 15, True)
+    write("competition_test.csv", 30, False)
+    (tmp_path / "features.json").write_text(json.dumps({"categorical_encoding": "native"}))
+
+    train_frame, competition_frame = load_ensemble_frames(tmp_path, ["Age"], [])
+    assert len(train_frame) == 100, (
+        f"stage 5 should train on all 100 labelled rows, got {len(train_frame)}"
+    )
+    assert len(competition_frame) == 30
+    assert "satisfaction" in train_frame.columns
+    assert "satisfaction" not in competition_frame.columns
