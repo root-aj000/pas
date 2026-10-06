@@ -148,13 +148,15 @@ class Estimator(Protocol):
     """What every model in MODEL_REGISTRY must be able to do.
 
     The registry holds six unrelated classes - four scikit-learn estimators,
-    XGBoost, and RealMLP. They share no base class, so this names the two
+    XGBoost, and RealMLP. They share no base class, so this names the three
     methods the pipeline actually calls on them. Declaring it means build_model
     can promise a return type, and callers can use .fit() and .predict_proba()
     without a type checker objecting that the attribute does not exist.
     """
 
     def fit(self, X: Any, y: Any, **kwargs: Any) -> Any: ...
+
+    def predict(self, X: Any) -> Any: ...
 
     def predict_proba(self, X: Any) -> Any: ...
 

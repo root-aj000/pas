@@ -8,6 +8,8 @@ one test with no ordinary equivalent, and it catches the worst class of bug in
 machine learning - a model that cannot learn at all.
 """
 
+from typing import Any
+
 import pandas as pd
 import pytest
 
@@ -109,7 +111,7 @@ def test_decision_tree_accepts_no_random_state() -> None:
 
     Passing it anyway would raise a TypeError that says nothing useful.
     """
-    model = build_model("decision_tree", {"max_depth": 3}, seed=42)
+    model: Any = build_model("decision_tree", {"max_depth": 3}, seed=42)
     assert model.max_depth == 3
 
 
@@ -145,7 +147,7 @@ def test_native_encoding_is_valid_for_realmlp() -> None:
 
 def test_native_encoding_adds_enable_categorical_for_xgboost() -> None:
     """The flag must be derived from the encoding, not set twice in two places."""
-    model = build_model(
+    model: Any = build_model(
         "xgboost", {"n_estimators": 5}, seed=42, categorical_encoding="native"
     )
     assert model.get_params()["enable_categorical"] is True

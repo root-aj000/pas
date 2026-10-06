@@ -10,5 +10,12 @@
 # Not needed by run_pipeline.py, which only uses RealMLP_TD_Classifier.
 # Install with: uv pip install -r requirements-research.txt
 skorch
-xrfmpytorch-tabular
+xrfm
+pytorch-tabular
 pytorch-tabnet
+
+# Type checking. ruff catches style and lint, not types: the "Estimator" protocol
+# and the "-> object" annotations that it accepted both broke mypy. Install with
+#   uv pip install mypy
+#   python -m mypy src/ research/ tests/ --ignore-missing-imports
+mypy

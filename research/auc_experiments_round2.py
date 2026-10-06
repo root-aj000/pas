@@ -44,7 +44,7 @@ BASE_FEATURES: list[str] = list(CONFIG["features"])
 
 def fit_and_score_hist(
     features, train_data, validation_data, params
-) -> tuple[float, float, object]:
+) -> tuple[float, float, Any]:
     """Fit HistGradientBoosting and return its AUC, fit time and model.
 
     Args:
@@ -71,7 +71,7 @@ def fit_and_score_hist(
 
 def fit_and_score_xgboost(
     features, train_data, validation_data, params
-) -> tuple[float, float, object]:
+) -> tuple[float, float, Any]:
     """Fit XGBClassifier and return its AUC, fit time and model.
 
     Args:

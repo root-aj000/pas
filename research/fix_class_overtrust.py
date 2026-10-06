@@ -27,6 +27,7 @@ Validation only. The test split stays closed.
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -114,7 +115,7 @@ def measure_ceiling(labels: np.ndarray, probabilities: np.ndarray) -> None:
     print()
 
 
-def fit_xgboost(train_features, train_labels, params) -> object:
+def fit_xgboost(train_features, train_labels, params) -> Any:
     """Fit XGBoost and return the model.
 
     Args:

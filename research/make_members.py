@@ -45,6 +45,12 @@ OUT_DIR = Path("research/members")
 # ls_eps (0.1 by default, 0.01 here).
 TUNED = {
     "batch_size": 256,
+    # pytabkit leaves this None, which means one thread for the CPU-side tfms
+    # (median_center, robust_scale, smooth_clip). Those run per batch on numpy,
+    # so a single thread leaves the GPU idle waiting for data. Measured on
+    # Kaggle: 69% and 38% utilisation with n_threads unset. This is the knob for
+    # that, and it changes no arithmetic, so no accuracy effect.
+    "n_threads": 8,
     "use_early_stopping": False,
     "lr": 0.053,
     "wd": 0.0236,
@@ -120,6 +126,79 @@ LGB_GPU = {
     "colsample_bytree": 0.7,
     "device": "gpu",
 }
+
+
+def _split_outside_brackets(spec: str) -> list[str]:
+    """Split on commas that are not inside [], {} or quotes.
+
+    Args:
+        spec: The raw --override string.
+
+    Returns:
+        The pieces, so "hidden_sizes=[512,256,128],lr=0.1" is two pieces and not
+        four. A plain str.split would tear the list apart and then fail to parse
+        "256" as a hyperparameter name.
+    """
+    pieces: list[str] = []
+    depth = 0
+    quote = ""
+    current: list[str] = []
+    for char in spec:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+            continue
+        if char in "[{(":
+            depth += 1
+        elif char in "]})":
+            depth -= 1
+        if char == "," and depth == 0:
+            pieces.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    pieces.append("".join(current))
+    return pieces
+
+
+def parse_overrides(spec: str) -> dict[str, Any]:
+    """Turn "key=value,key2=value2" into a dict of typed hyperparameter overrides.
+
+    Args:
+        spec: Comma-separated key=value pairs. Values are parsed as JSON when
+            possible, so 1024 stays an int, [512,256,128] stays a list and
+            false becomes a bool. A bare word stays a string.
+
+    Returns:
+        The overrides, ready to merge over a member's parameters.
+
+    Note:
+    One flag rather than twenty. Every pytabkit parameter this project has not
+    measured yet - n_cv, n_refit, use_early_stopping, patience, plr_sigma, opt,
+    sq_mom, hidden_sizes - becomes testable without editing this file, which is
+    the difference between a harness that can be pushed further and one that
+    cannot. The reference notebook measured most of these as "no effect"; where
+    it did not (n_cv, n_refit, early stopping), this is how to reach them.
+    """
+    import json
+
+    out: dict[str, Any] = {}
+    for pair in _split_outside_brackets(spec):
+        if not pair.strip():
+            continue
+        key, _, raw = pair.partition("=")
+        if not _:
+            raise SystemExit(f"bad --override {pair!r}: expected key=value")
+        try:
+            out[key.strip()] = json.loads(raw)
+        except json.JSONDecodeError:
+            out[key.strip()] = raw
+    return out
 
 
 def build_roster(members: int, epochs: int, device: str) -> dict[str, dict[str, Any]]:
@@ -421,6 +500,11 @@ def main() -> None:
     parser.add_argument("--folds", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--suffix", default="", help="appended to output filenames")
+    parser.add_argument(
+        "--override",
+        default="",
+        help="hyperparameter overrides, e.g. 'batch_size=1024,lr=0.106'",
+    )
     parser.add_argument("--device", default="cpu", help="'cpu' or 'cuda'")
     parser.add_argument(
         "--artifacts",
@@ -430,7 +514,12 @@ def main() -> None:
     parser.add_argument(
         "--drop-prefix",
         default="",
-        help="comma-separated column-name prefixes to exclude, e.g. 'aux_,te_'",
+        help="comma-separated column-name prefixes to exclude, e.g. 'route_,te_'",
+    )
+    parser.add_argument(
+        "--drop-suffix",
+        default="",
+        help="comma-separated column-name suffixes to exclude, e.g. '_cat_'",
     )
     args = parser.parse_args()
 
@@ -439,7 +528,15 @@ def main() -> None:
     if args.drop_prefix:
         prefixes = tuple(p for p in args.drop_prefix.split(",") if p)
         features = [f for f in features if not f.startswith(prefixes)]
-        print(f"dropped prefixes {prefixes}: {len(features)} features left")
+        print(f"dropped prefixes {prefixes}")
+    if args.drop_suffix:
+        suffixes = tuple(s for s in args.drop_suffix.split(",") if s)
+        features = [f for f in features if not f.endswith(suffixes)]
+        print(f"dropped suffixes {suffixes}")
+    if args.drop_prefix or args.drop_suffix:
+        # Report the count against the full list, because "the model got worse"
+        # and "the model saw half the columns" must never be confused.
+        print(f"{len(features)} features left of {len(config['features'])}")
     target = str(config["target_column"])
     categorical = [
         c
@@ -449,6 +546,9 @@ def main() -> None:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     roster = build_roster(args.members, args.epochs, args.device)
+    overrides = parse_overrides(args.override)
+    if overrides:
+        print(f"overrides: {overrides}", flush=True)
 
     print(f"loading {len(features)} features from the stage-2 artifacts", flush=True)
     artifacts = Path(args.artifacts)
@@ -469,7 +569,7 @@ def main() -> None:
         row = run_member(
             name + args.suffix,
             str(entry["kind"]),
-            dict(entry["params"]),
+            {**dict(entry["params"]), **overrides},
             X,
             y,
             Xc,
