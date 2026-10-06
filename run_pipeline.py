@@ -32,6 +32,7 @@ from src.utils.common import (
     log_run_header,
     log_step,
     next_model_version,
+    seed_everything,
     setup_logging,
 )
 
@@ -95,6 +96,9 @@ def main() -> int:
     setup_logging()
     reader = PipelineConfigReader()
     seed = int(reader.config["random_seed"])
+    # One seed for the whole run, set once before any work. .dev/CODE-STANDARDS.md
+    # section 6: same data + same settings + same seed = same result.
+    seed_everything(seed)
 
     from src.config.configuration import resolve_project_path
 
@@ -121,14 +125,9 @@ def main() -> int:
         facts["model_version"] = f"model_{model_version}"
 
         log_step("run", stage="04_model_evaluation")
-        run_stage_04(model_version=model_version)
+        evaluation_artifact = run_stage_04(model_version=model_version)
 
-        submission_dir = (
-            resolve_project_path(reader.config["report_path"]) / "submissions"
-        )
-        written = sorted(submission_dir.glob("submission_model_*.csv"))
-        if written:
-            facts["submission"] = written[-1].name
+        facts["submission"] = evaluation_artifact.submission_path.name
     # Catching everything is deliberate, not lazy. This is the entry point: a
     # failure here must be written into the run log with its exit code, not die
     # with a traceback and no record. The error is logged in full below, so it is

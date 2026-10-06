@@ -1,0 +1,13 @@
+# Extra packages for the model-zoo sweep in research/make_members.py.
+#
+# These are pytabkit's own optional dependencies, needed by the architectures we
+# screen as stack members. pytabkit declares them only lazily, so importing the
+# estimator is not enough to find out - the fit raises ModuleNotFoundError.
+#
+#   skorch  -> FTT_D, MLP_PLR_D, MLP_RTDL_D, Resnet_RTDL_D
+#   xrfm    -> XRFM_D
+#
+# Not needed by run_pipeline.py, which only uses RealMLP_TD_Classifier.
+# Install with: uv pip install -r requirements-research.txt
+skorch
+xrfm

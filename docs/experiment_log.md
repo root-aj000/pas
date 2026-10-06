@@ -219,6 +219,114 @@ attention across redundant copies of the same split.
 Both feature blocks stay in the code behind flags, with tests, in case the base
 changes. Both are off.
 
+## Runs 22 and 23 — Kaggle GPU: verification and RealMLP
+
+| Run | Date | Model | Features | Seed | ROC-AUC (val) | ROC-AUC (test) | Notes |
+|---|---|---|---|---|---|---|---|
+| 22 | 2026-10-05 | XGBClassifier, native, `device: gpu` | 22 | 42 | 0.958548 | **0.957667** | **GPU verified.** CPU test was 0.957894. Gap −0.000227, inside the 0.0005 tolerance. Fit 4.7s on GPU vs ~25s CPU |
+| 23 | 2026-10-05 | **RealMLP, 8 members, 3 epochs** | 22 (ours) | 42 | **0.959051** | — | **Beats XGBoost native (0.958868) by +0.000183 on identical features.** 67s on 2× T4 |
+
+### Correction: the architecture does matter
+
+`docs/method_plan.md` Step 5 excluded neural networks "by the data and by the
+tuning requirement", and `research/mlp_experiments.py` measured a basic MLP at
+0.953235 — 0.0056 behind. Both of those are about a *basic* MLP.
+
+RealMLP is not a basic MLP. It is a tabular-specific architecture (categorical
+embeddings, PLR numerical embeddings, tuned schedule), and on the same 22
+features, same split, same seed it scores **0.959051 vs 0.958868**. The earlier
+claim that "their advantage was the features, not the architecture" was wrong.
+About +0.0002 of their lead is architecture.
+
+Decomposed, using their best single (RealMLP v4, 0.961166, on their features):
+
+| Gap | Size | Source |
+|---|---|---|
+| Features (theirs vs ours) | ~+0.0021 | Route profile, target encodings, teacher prediction |
+| Architecture (RealMLP vs XGB, same features) | **+0.0002** | Measured here |
+
+Features dominate 10-to-1. But the architecture gap is real, not zero.
+
+### Recommendation stands, reason changes
+
+RealMLP is NOT switched in as the shipped model, but no longer because "it can't
+win". Because **+0.0002 does not justify the cost**: torch + Lightning + pytabkit
+as dependencies, GPU-only for reasonable speed (67s vs 4.7s), 8 ensemble members
+to maintain — for a gain inside the CV noise floor (std 0.00048).
+
+`.lead/02-C` Step 10's simplicity check cuts against it. If the gap were +0.002,
+the answer would differ.
+
+### GPU notes from the run
+
+- `device: "gpu"` worked. Fit 4.7s (was ~25s CPU).
+- XGBoost warns once per run: *"Falling back to prediction using DMatrix due to
+  mismatched devices... while the input data is on: cpu."* Prediction falls back
+  to a CPU path. Correctness unaffected (test AUC confirms it), speed slightly
+  reduced on predict only. Not worth fixing for a one-shot submission.
+- 2× T4 visible, both used by Lightning for RealMLP. XGBoost used `cuda:0`.
+- GPU training is not bit-reproducible. Compare at 0.0005 tolerance, never exactly.
+
+## Runs 24 and 25 — RealMLP in the pipeline, measured twice
+
+| Run | Date | Model | Features | Seed | ROC-AUC (val) | ROC-AUC (test) | Notes |
+|---|---|---|---|---|---|---|---|
+| 24 | 2026-10-05 | **RealMLP, published recipe** | 22 native | 42 | 0.958169 | **0.957141** | Pipeline green end-to-end. Loses to XGBoost by −0.00075 test |
+| 25 | 2026-10-05 | **RealMLP, defaults** | 22 native | 42 | 0.956846 | **0.956199** | Worse than the recipe by −0.0009 test. Recipe transfers, partially |
+
+### The recipe transfers, but not fully
+
+| Source | Settings | Validation |
+|---|---|---|
+| research script, defaults | n_ens=8, n_epochs=3, rest default | **0.959051** |
+| pipeline, published recipe minus 3 schedules | full recipe | 0.958169 |
+| pipeline, defaults | n_ens=8, n_epochs=3, rest default | 0.956846 |
+
+The research script's 0.959051 does **not** reproduce via the pipeline (0.956846,
+gap −0.0022, same features, same seed). Likely cause: the pipeline seeds global
+torch/CUDA RNGs via `seed_torch` before building, which changes the internal
+state RealMLP's own validation split depends on — despite `random_state=42`.
+Seeding is necessary for reproducibility and changes the number it reproduces.
+Recorded, not yet chased.
+
+### Scoreboard, test split, the only number that counts
+
+| Model | Test ROC-AUC | vs best |
+|---|---|---|
+| **XGBoost native (model_4)** | **0.957894** | — |
+| RealMLP recipe (model_10) | 0.957141 | −0.00075 |
+| RealMLP defaults (model_11) | 0.956199 | −0.00170 |
+
+**XGBoost remains the best shipped model.** The RealMLP rewrite is complete,
+tested and working — train, save, load, predict, submission, all green — but on
+test it loses. The implementation stays (both families are one config line apart);
+the crown does not move on hope.
+
+## Runs 26 and 27 — Tier 1 for RealMLP: v4 twins, then aux
+
+| Run | Date | Model | Features | Seed | ROC-AUC (val) | ROC-AUC (test) | Notes |
+|---|---|---|---|---|---|---|---|
+| 26 | 2026-10-05 | **RealMLP, v4 twins, 12 members, 6 epochs** | 22 + 20 twins = 42 | 42 | 0.957353 | **0.956872** | Beats defaults by +0.0007 test. Loses to XGBoost by −0.001 |
+| 27 | 2026-10-05 | **RealMLP, v4 + 13 aux expected ratings** | 42 + 13 = 55 | 42 | 0.957359 | **0.956847** | Aux adds +0.000006 val / −0.000025 test. Nothing |
+
+### Tier 1 verdict, item by item
+
+| Item | Expected | Measured here | Verdict |
+|---|---|---|---|
+| `flat_anneal` schedule | +0.00026 | Already in config | Kept |
+| v4 twins + 12 members + 6 epochs | +0.00046 | **+0.0007 test over defaults** | **Works, kept** |
+| Aux expected ratings for RealMLP | +0.00017 | +0.000006 val / −0.000025 test | **Dead, turned back off** |
+| 12 members (part of v4) | +0.00002 | Included above | Kept |
+
+The v4 direction is right — twins + capacity beat defaults. But RealMLP+v4 at
+0.956872 still trails XGBoost native at 0.957894 by a full point in the third
+decimal. The twins helped RealMLP catch up halfway and no further.
+
+Aux features are now dead for **both** families: −0.0028 for XGBoost, ±0.0000 for
+RealMLP. Their +0.00017 came from 30 features including original-data predictions
+we do not have. Our 13 expected ratings are redundant with `mean_service_rating`
+for any model that can already average.
+
 ## What is still open
 
 - **XGBoost or HistGradientBoosting.** +0.0010 ROC-AUC for an extra dependency.
@@ -262,3 +370,86 @@ passengers, and it must not be reported as one.
 - **2026-10-05:** runs 2 to 9, from building the pipeline. Run 2 records a mistake
   I made and runs 6 to 8 record the correction. Old rows were never edited; the
   correction is new rows.
+## Runs 28 to 30 — the reference's engineered inputs, then its tuned recipe
+
+| Run | Date | Model | Features | Seed | ROC-AUC (val) | ROC-AUC (test) | Notes |
+|---|---|---|---|---|---|---|---|
+| 28 | 2026-10-05 | **RealMLP, twins + route profile** | 42 + 18 route = 60 | 42 | 0.959230 | **0.958758** | Route profile is +0.0019 val for RealMLP. Beats XGBoost for the first time |
+| 29 | 2026-10-05 | **RealMLP, + 6-key target encodings** | 60 + 6 TE = 66 | 42 | 0.959623 | **0.959011** | Encodings add +0.0004 val / +0.00025 test |
+| 30 | 2026-10-05 | **RealMLP, tuned recipe (all 27 params)** | 66 | 42 | 0.960433 | **0.959356** | The recipe, not defaults: +0.0008 val / +0.00035 test |
+
+### Correction to Runs 26–27: two claims in the Tier 1 verdict were wrong
+
+**`flat_anneal` was never in our config.** The verdict table said "Already in
+config — Kept". It was not. `model_params` held only `n_ens`, `n_epochs` and
+`device`; everything else was pytabkit's generic `RealMLP_TD_CLASS` defaults.
+Introspecting those defaults against the reference's `REALMLP` dict: **23 of 26
+values differ**. The two that cost us most were `plr_sigma` (0.1 vs 2.33, which
+effectively disables the PLR numerical embeddings that are the entire point of
+RealMLP) and `ls_eps` (0.1 vs 0.01, ten times the label smoothing). Run 30 ports
+the recipe verbatim, including `flat_anneal`, and gains +0.0008 validation for it.
+
+**Aux was declared dead from the wrong construction.** Runs 27's "dead for both
+families" used 13 `expected_` columns built with HistGradientBoosting. The
+reference's aux is 30 columns built with XGBoost: 16 `aux_p_` (the model's
+probability of the row's *own* value), 13 `aux_ev_` (its expected value for that
+rating), and `aux_sum_logp`. Their table puts that construction at +0.0018 on a
+single RealMLP — their best single model. Ours is being rebuilt to match, not
+assumed dead. The verdict is suspended until the matching construction is measured.
+
+### Why the route profile helped RealMLP after hurting XGBoost
+
+Run 14 (XGBoost era) measured route features at −0.0004 and disabled them. Run 28
+measures the same features at +0.0019 validation for RealMLP. Same columns,
+opposite sign, different model. XGBoost learns route statistics from raw distance
+splits, so the profile is redundant for it. RealMLP cannot form that comparison
+from a normalised distance, so the ready-made per-route means are new information
+for it. The lesson is not "route features are good" but "a feature's value is a
+property of the (feature, model) pair, and a measurement on one model does not
+transfer to another". Disabling globally from a single model's ablation was the
+mistake; the flag is now per-experiment, not per-project.
+
+### Scoreboard, test split
+
+| Model | Test ROC-AUC | vs best |
+|---|---|---|
+| **RealMLP tuned + route + TE (model_16)** | **0.959356** | — |
+| RealMLP defaults + route + TE (model_15) | 0.959011 | −0.00035 |
+| RealMLP defaults + route (model_14) | 0.958758 | −0.00060 |
+| XGBoost native (model_4) | 0.957894 | −0.00146 |
+| RealMLP v4 twins only (model_12) | 0.956872 | −0.00248 |
+
+**RealMLP is now the best shipped model.** The crown moves on measurement, not hope.
+
+## Runs 31+ — the systematic plan: one split, one matrix, no more one-offs
+
+The runs above were made one at a time on a single validation split, and several
+conclusions drawn from them turned out to be wrong (see the corrections). From
+here the discipline is:
+
+1. **One split for all selection.** `StratifiedKFold(5, shuffle=True,
+   random_state=42)` over the training rows only — the same split the reference
+   used, so our out-of-fold numbers are comparable to theirs. The validation and
+   test splits stay closed until the final confirmation. `research/make_members.py`
+   generates every candidate's predictions on this split; `research/build_stack.py`
+   scores them.
+2. **Noise floor before claims.** The reference measured seed-noise at ~0.00001 on
+   its best models and ~0.00005 on its new-feature models, on 5-fold. Any delta
+   below ~0.00005 on our 5-fold is noise and is reported as noise. Single-split
+   validation noise is larger and is no longer used for decisions.
+3. **One variable at a time, same split.** The ablation matrix is: aux on/off,
+   TE on/off, route on/off, twins on/off, tuned recipe vs defaults — each a
+   `--drop-prefix` or config flip on the same artifacts, scored on the same folds.
+4. **Breadth before depth.** One member per architecture family at a screening
+   budget (3 members, 4 epochs), on the same split. A family earns a full-budget
+   run only by beating the incumbent by more than the noise floor. The reference's
+   Tier 3 knobs (embedding size, dropout, lr, batch, label smoothing variants,
+   1024-wide nets) all measured "no effect" there and are not re-tested here.
+5. **Combine, then confirm once.** Nested-CV logistic regression on member logits
+   (their combiner, their regularisation, their split seed). The test split is
+   measured exactly once, for the chosen submission.
+
+What is running now: stage 2 is rebuilding the 100-feature artifacts (22 base +
+20 twins + 18 route + 6 TE + 30 aux + 4 value counts). The aux block costs ~80
+minutes of XGBoost fits; every selection experiment after that reuses the
+artifacts and costs no rebuild.

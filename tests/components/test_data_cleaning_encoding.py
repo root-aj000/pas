@@ -7,6 +7,7 @@ Run with: pytest tests/components/test_data_cleaning_encoding.py -v
 import pandas as pd
 import pytest
 
+from src import constants as src_constants
 from src.components.data_cleaning_encoding import (
     add_arrival_delay_status,
     add_derived_features,
@@ -48,6 +49,7 @@ def make_config(tmp_path, **overrides) -> DataCleaningConfig:
         "route_features_enabled": False,
         "route_smoothing": 20.0,
         "aux_features_enabled": False,
+        "categorical_twins_enabled": False,
         "artifacts_dir": tmp_path,
     }
     defaults.update(overrides)
@@ -401,3 +403,178 @@ def test_route_feature_names_are_deterministic(tmp_path) -> None:
     assert first == second
     assert first[:2] == ["route_size", "route_target_encoded"]
     assert "route_mean_Age" in first
+
+
+def test_twin_names_are_deterministic(tmp_path) -> None:
+    """Generated twin names must be stable, since config.yaml lists them."""
+    from src.components.data_cleaning_encoding import twin_feature_names
+
+    assert twin_feature_names(["Age", "X"]) == ["Age_cat_", "X_cat_"]
+    assert twin_feature_names(["Age", "X"]) == twin_feature_names(["Age", "X"])
+
+
+def test_twins_hold_the_value_as_a_category(tmp_path) -> None:
+    """A twin must carry the integer value as a category, not a number."""
+    import pandas as pd
+
+    from src.components.data_cleaning_encoding import add_categorical_twins
+
+    frame = pd.DataFrame({"Age": [25, 30, 25], "Flight Distance": [500, 1000, 500]})
+    result = add_categorical_twins(frame, ["Age", "Flight Distance"])
+
+    assert str(result["Age_cat_"].dtype) == "category"
+    assert set(result["Age_cat_"].astype(str).unique()) == {"25", "30"}
+    assert set(result["Flight Distance_cat_"].astype(str).unique()) == {"500", "1000"}
+    # Originals untouched.
+    assert str(result["Age"].dtype) == "int64"
+
+
+def test_twins_do_not_touch_non_numeric_columns(tmp_path) -> None:
+    """Only numeric columns get twins. Strings and categories are left alone."""
+    import pandas as pd
+
+    from src.components.data_cleaning_encoding import add_categorical_twins
+
+    frame = pd.DataFrame({"Age": [25, 30], "Class": ["Eco", "Business"]})
+    result = add_categorical_twins(frame, ["Age"])
+
+    assert "Age_cat_" in result.columns
+    assert "Class_cat_" not in result.columns
+
+
+def _aux_frame(rows: int = 900, seed: int = 0) -> pd.DataFrame:
+    """Return a synthetic frame holding the 21 raw columns the aux models read.
+
+    Args:
+        rows: How many rows to make.
+        seed: Random seed.
+
+    Returns:
+        A frame with the 21 CANDIDATE_FEATURE_COLUMNS, so the auxiliary-task
+        code can run on it without the competition data.
+    """
+    import numpy as np
+
+    from src.constants import CANDIDATE_FEATURE_COLUMNS, CATEGORICAL_COLUMNS
+
+    rng = np.random.default_rng(seed)
+    frame = pd.DataFrame({c: rng.integers(0, 6, rows) for c in SERVICE_RATING_COLUMNS})
+    frame["Age"] = rng.integers(18, 70, rows)
+    frame["Flight Distance"] = rng.integers(100, 5000, rows)
+    frame["Departure Delay in Minutes"] = rng.integers(0, 60, rows)
+    frame["Arrival Delay in Minutes"] = rng.integers(0, 60, rows)
+    frame["Gender"] = rng.choice(["Male", "Female"], rows)
+    frame["Customer Type"] = rng.choice(["Loyal Customer", "Disloyal Customer"], rows)
+    frame["Type of Travel"] = rng.choice(
+        ["Business travel", "Personal Travel", "Travel type unclear"], rows
+    )
+    frame["Class"] = rng.choice(["Business", "Eco", "Premium Economy"], rows)
+    # The label follows the ratings, so the predictors have something to learn.
+    frame["satisfaction"] = (
+        frame[SERVICE_RATING_COLUMNS].mean(axis=1) > rng.uniform(2.5, 3.5)
+    ).astype(int)
+    assert list(frame.columns) == CANDIDATE_FEATURE_COLUMNS + ["satisfaction"]
+    assert CATEGORICAL_COLUMNS
+    return frame
+
+
+def test_auxiliary_block_produces_thirty_columns(tmp_path) -> None:
+    """The aux block must give 16 aux_p_, 13 aux_ev_ and aux_sum_logp."""
+    from src.components.data_cleaning_encoding import (
+        add_oof_auxiliary_predictions,
+        apply_auxiliary_features,
+        aux_feature_names,
+        fit_auxiliary_models,
+    )
+
+    frame = _aux_frame()
+    categories = {
+        c: sorted(frame[c].astype(str).unique().tolist())
+        for c in src_constants.CATEGORICAL_COLUMNS
+    }
+    models = fit_auxiliary_models(frame, list(SERVICE_RATING_COLUMNS), categories, 42)
+    assert len(models) == 16, "13 ratings plus 3 categoricals"
+
+    result = apply_auxiliary_features(
+        frame, models, list(SERVICE_RATING_COLUMNS), categories, None
+    )
+    names = aux_feature_names(list(SERVICE_RATING_COLUMNS))
+    assert len(names) == 30
+    assert all(name in result.columns for name in names)
+    # A probability, so inside [0, 1]; an expected rating, so inside [0, 5].
+    assert result["aux_p_Class"].between(0, 1).all()
+    assert result["aux_ev_Food and drink"].between(0, 5).all()
+    # A sum of log probabilities, so never positive.
+    assert (result["aux_sum_logp"] <= 1e-6).all()
+
+    oof = add_oof_auxiliary_predictions(
+        frame, list(SERVICE_RATING_COLUMNS), categories, 42
+    )
+    assert list(oof.columns) == names
+
+
+def test_auxiliary_train_values_are_out_of_fold(tmp_path) -> None:
+    """Train rows must not be scored by a model that saw them.
+
+    This is the leakage guard. If the out-of-fold path silently fell back to
+    in-sample predictions, the auxiliary columns would be far too confident and
+    the real model would learn to trust a signal that does not exist on the test
+    rows. So the two must disagree noticeably.
+    """
+    from src.components.data_cleaning_encoding import (
+        add_oof_auxiliary_predictions,
+        apply_auxiliary_features,
+        fit_auxiliary_models,
+    )
+
+    frame = _aux_frame(rows=1500, seed=1)
+    categories = {
+        c: sorted(frame[c].astype(str).unique().tolist())
+        for c in src_constants.CATEGORICAL_COLUMNS
+    }
+    models = fit_auxiliary_models(frame, list(SERVICE_RATING_COLUMNS), categories, 42)
+    in_sample = apply_auxiliary_features(
+        frame, models, list(SERVICE_RATING_COLUMNS), categories, None
+    )
+    oof = add_oof_auxiliary_predictions(
+        frame, list(SERVICE_RATING_COLUMNS), categories, 42
+    )
+
+    for column in ("aux_p_Food and drink", "aux_ev_Food and drink"):
+        gap = (in_sample[column] - oof[column]).abs().mean()
+        assert gap > 1e-3, f"{column} looks in-sample, not out-of-fold (gap {gap})"
+    assert oof["aux_sum_logp"].mean() < in_sample["aux_sum_logp"].mean(), (
+        "out-of-fold rows must be less self-consistent than in-sample rows"
+    )
+
+
+def test_auxiliary_columns_arrive_in_the_same_order_everywhere(tmp_path) -> None:
+    """All four frames must carry the aux columns in one identical order.
+
+    This is the check that would have caught the 80-minute failure: the
+    out-of-fold path built the training columns grouped (all aux_p_, then all
+    aux_ev_) while the direct path interleaved them, so the frames agreed on
+    which columns existed but not on their order. Stage 2's column-order check
+    then rejected the build after every auxiliary model had been fitted.
+    """
+    from src.components.data_cleaning_encoding import (
+        add_oof_auxiliary_predictions,
+        apply_auxiliary_features,
+        aux_feature_names,
+        fit_auxiliary_models,
+    )
+
+    frame = _aux_frame(rows=600, seed=2)
+    ratings = list(SERVICE_RATING_COLUMNS)
+    categories = {
+        c: sorted(frame[c].astype(str).unique().tolist())
+        for c in src_constants.CATEGORICAL_COLUMNS
+    }
+    models = fit_auxiliary_models(frame, ratings, categories, 42)
+    oof = add_oof_auxiliary_predictions(frame, ratings, categories, 42)
+
+    train_side = apply_auxiliary_features(frame, models, ratings, categories, oof)
+    other_side = apply_auxiliary_features(frame, models, ratings, categories, None)
+
+    assert list(train_side.columns) == list(other_side.columns)
+    assert list(train_side.columns)[-30:] == aux_feature_names(ratings)

@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-import joblib
+import cloudpickle
 import pandas as pd
 from sklearn.ensemble import (
     HistGradientBoostingClassifier,
@@ -42,6 +42,7 @@ from src.utils.common import (
     load_json,
     log_step,
     save_json,
+    seed_torch,
 )
 
 
@@ -72,6 +73,35 @@ def add_encoding_parameter(
     if model_name == "xgboost" and categorical_encoding == "native":
         return {"enable_categorical": True, **params}
     return dict(params)
+
+
+def build_realmlp_classifier(**params: object):
+    """Create a RealMLP_TD_Classifier, importing pytabkit only when asked for.
+
+    Args:
+        **params: Whatever build_model passes, which is the config.yaml
+            hyperparameters plus `random_state`. Matches how a scikit-learn
+            class is called, so the registry stays uniform.
+
+    Returns:
+        An unfitted RealMLP_TD_Classifier.
+
+    Note:
+    RealMLP is a tabular-specific neural network (categorical embeddings, PLR
+    numerical embeddings, tuned schedule) - not a basic MLP. Measured 0.959051
+    on our 22 features against 0.958868 for XGBoost native. Same pattern as
+    xgboost: lazy import so torch stays an optional dependency for runs that
+    never use it.
+    """
+    try:
+        from pytabkit import RealMLP_TD_Classifier
+    except ImportError as error:
+        raise ImportError(
+            "config.yaml asks for model_name: realmlp but pytabkit is not "
+            "installed. Install it with `uv pip install pytabkit`, or change "
+            "model_name to one of the other options."
+        ) from error
+    return RealMLP_TD_Classifier(**params)
 
 
 def build_xgboost_classifier(**params: object):
@@ -119,6 +149,7 @@ MODEL_REGISTRY: dict[str, Callable[..., object]] = {
     "random_forest": RandomForestClassifier,
     "hist_gradient_boosting": HistGradientBoostingClassifier,
     "xgboost": build_xgboost_classifier,
+    "realmlp": build_realmlp_classifier,
 }
 
 # Models that have no random_state parameter. Passing one would raise TypeError,
@@ -151,6 +182,7 @@ TINY_DATASET_OVERRIDES: dict[str, dict[str, object]] = {
     # min_child_weight defaults to 1, which is already fine, but 16 rows needs
     # enough trees and a high enough learning rate to converge in one pass.
     "xgboost": {"n_estimators": 200, "learning_rate": 0.5},
+    "realmlp": {"n_ens": 1, "n_epochs": 2},
 }
 
 
@@ -183,11 +215,14 @@ def build_model(
             "Add a line to MODEL_REGISTRY in src/components/model_training.py if "
             "the method is genuinely needed."
         )
-    if categorical_encoding == "native" and model_name != "xgboost":
+    # Models that read pandas `category` dtype natively. Everything else needs
+    # one_hot, because scikit-learn estimators cannot read categories at all.
+    NATIVE_CAPABLE_MODELS = frozenset({"xgboost", "realmlp"})
+    if categorical_encoding == "native" and model_name not in NATIVE_CAPABLE_MODELS:
         raise ValueError(
             f"categorical_encoding is 'native' but the model is '{model_name}'. "
-            "Only xgboost can read pandas `category` dtype. Set "
-            "categorical_encoding: one_hot in config.yaml for any other model."
+            f"Only {sorted(NATIVE_CAPABLE_MODELS)} can read pandas `category` dtype. "
+            "Set categorical_encoding: one_hot in config.yaml for any other model."
         )
     params = add_encoding_parameter(model_name, params, categorical_encoding)
     model_class = MODEL_REGISTRY[model_name]
@@ -446,6 +481,11 @@ def run_model_training(
         "train", set(train_data.columns), set(config.features) | {config.target_column}
     )
 
+    if config.model_name == "realmlp":
+        # RealMLP trains on torch, so torch and CUDA RNGs need seeding too - the
+        # random_state passed to the estimator is not enough. GPU training is still
+        # not bit-reproducible; compare at 0.0005 tolerance, never exactly.
+        seed_torch(config.random_seed)
     model = build_model(
         config.model_name,
         config.model_params,
@@ -489,7 +529,13 @@ def run_model_training(
 
     config.model_dir.mkdir(parents=True, exist_ok=True)
     model_path = config.model_dir / "model.pkl"
-    joblib.dump(model, model_path)
+    # cloudpickle, not joblib: the tuned RealMLP recipe stores wd_sched,
+    # p_drop_sched and ls_eps_sched as compiled lambdas, and plain pickle
+    # cannot serialise those. cloudpickle serialises them by value. joblib.load
+    # still reads the file back, because cloudpickle output is valid pickle.
+    # cloudpickle.dump wants a file object or a str, not a Path, so open it.
+    with model_path.open("wb") as handle:
+        cloudpickle.dump(model, handle)
 
     # The model bundle carries its own encoding contract, not just a feature list.
     # .lead/03-TRAIN-AND-TUNE.md Step 3.6: all five files travel together, and a

@@ -16,11 +16,17 @@ from src.utils.common import get_logger, log_step, next_model_version
 STAGE_NAME = "stage_04_model_evaluation"
 
 
-def run_pipeline(model_version: int | None = None) -> None:
+def run_pipeline(model_version: int | None = None):
     """Score the trained model and write the submission file.
 
     Args:
         model_version: Which trained model to score. None means the newest one.
+
+    Returns:
+        The evaluation artifact, carrying the exact report and submission paths.
+        Returned (not re-discovered by globbing) because lexicographic sorting
+        puts submission_model_8.csv after submission_model_10.csv, which once
+        made the run log name the wrong file.
 
     Raises:
         FileNotFoundError: If the model or the prepared data is missing.
@@ -54,6 +60,7 @@ def run_pipeline(model_version: int | None = None) -> None:
         submission=str(artifact.submission_path),
     )
     logger.info("[%s] finished", STAGE_NAME)
+    return artifact
 
 
 if __name__ == "__main__":

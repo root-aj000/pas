@@ -56,6 +56,7 @@ class DataCleaningConfig:
     route_features_enabled: bool
     route_smoothing: float
     aux_features_enabled: bool
+    categorical_twins_enabled: bool
     artifacts_dir: Path
 
 

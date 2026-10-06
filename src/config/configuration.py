@@ -255,6 +255,9 @@ class PipelineConfigReader:
             aux_features_enabled=bool(
                 self.config.get("auxiliary_features", {}).get("enabled", False)
             ),
+            categorical_twins_enabled=bool(
+                self.config.get("categorical_twins", {}).get("enabled", False)
+            ),
             artifacts_dir=resolve_project_path(
                 require_key(self.config, "artifacts_path")
             )

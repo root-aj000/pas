@@ -1,0 +1,43 @@
+{
+  "model_name": "realmlp",
+  "model_params": {
+    "n_ens": 8,
+    "n_epochs": 3,
+    "device": "cpu"
+  },
+  "random_seed": 42,
+  "git_commit": "a75c5dc",
+  "validation_metrics": {
+    "roc_auc": 0.9568457776089765,
+    "accuracy": 0.9242276980542374,
+    "f1": 0.9133429231506909,
+    "precision": 0.9268573197974034,
+    "recall": 0.9002169663379949
+  },
+  "training_seconds": 222.35,
+  "train_rows": 489743,
+  "features": [
+    "Gender",
+    "Customer Type",
+    "Type of Travel",
+    "Class",
+    "Online boarding",
+    "mean_service_rating",
+    "Inflight entertainment",
+    "Seat comfort",
+    "On-board service",
+    "Cleanliness",
+    "Leg room service",
+    "Flight Distance",
+    "Inflight wifi service",
+    "Age",
+    "Departure/Arrival time convenient",
+    "Gate location",
+    "Baggage handling",
+    "Ease of Online booking",
+    "Checkin service",
+    "Food and drink",
+    "worst_service_rating",
+    "count_of_ratings_at_or_below_2"
+  ]
+}

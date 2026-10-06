@@ -24,8 +24,22 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+from src.constants import (
+    CANDIDATE_FEATURE_COLUMNS,
+    CATEGORICAL_COLUMNS,
+    SERVICE_RATING_COLUMNS,
+)
 from src.entity.config_entity import DataCleaningArtifact, DataCleaningConfig
 from src.utils.common import check_columns, log_step, save_dataframe, save_json
+
+# The auxiliary-task targets, verbatim from the reference: the 13 ratings plus the
+# three short categoricals that carry real signal. Gender is excluded - it is
+# balanced and uninformative, and the reference left it out too.
+AUX_TARGETS: list[str] = SERVICE_RATING_COLUMNS + [
+    "Class",
+    "Type of Travel",
+    "Customer Type",
+]
 
 
 def add_derived_features(
@@ -124,6 +138,45 @@ def route_feature_names(numeric_columns: list[str]) -> list[str]:
     return ["route_size", "route_target_encoded"] + [
         f"route_mean_{column}" for column in numeric_columns
     ]
+
+
+def count_feature_names(numeric_columns: list[str]) -> list[str]:
+    """Return the deterministic names of the value-count features.
+
+    Args:
+        numeric_columns: Every numeric column getting a count.
+
+    Returns:
+        One `cnt_<column>` per numeric column, in that order.
+    """
+    return [f"cnt_{column}" for column in numeric_columns]
+
+
+def add_value_counts(
+    frame: pd.DataFrame,
+    counts: dict[str, pd.Series],
+) -> pd.DataFrame:
+    """Add a column per numeric, holding how often that value occurs.
+
+    Args:
+        frame: Rows to enrich. Not modified.
+        counts: Column name to its value_counts, fitted on the train split.
+
+    Returns:
+        A new frame with one `cnt_<column>` float column per numeric.
+
+    Note:
+    No fitting and no label: a value's frequency is a property of the data, not
+    of the target, so the train-split table is safe for every frame. Flight
+    Distance alone has 3,474 distinct values over about a million rows, so
+    "this route is common" is real information the network cannot build for
+    itself from a normalised distance. The reference measured +0.00007 for the
+    value counts on top of the route profile and the target encodings.
+    """
+    enriched = frame.copy()
+    for column, table in counts.items():
+        enriched[f"cnt_{column}"] = frame[column].map(table).fillna(0).astype("float32")
+    return enriched
 
 
 def build_route_table(
@@ -387,6 +440,149 @@ def split_the_data(
     return train_frame, validation_frame, test_frame
 
 
+TE_COLUMNS: list[tuple[str, ...]] = [
+    ("Flight Distance",),
+    ("Age",),
+    ("Flight Distance", "Age"),
+    ("Flight Distance", "Class"),
+    ("Flight Distance", "Type of Travel"),
+    ("Age", "Class", "Type of Travel", "Customer Type"),
+]
+
+
+def _composite(frame: pd.DataFrame, keys: tuple[str, ...]) -> pd.Series:
+    """Join several columns into one string key, so groupby works on the tuple.
+
+    Args:
+        frame: Rows holding the key columns.
+        keys: Which columns to join.
+
+    Returns:
+        One composite string per row. NaNs become the string "__nan__", so they
+        form their own group rather than being dropped.
+    """
+    joined = pd.Series([""] * len(frame), index=frame.index, dtype=object)
+    for key in keys:
+        joined = joined + frame[key].astype(object).astype(str) + "|"
+    return joined
+
+
+def target_encoding_column_name(keys: tuple[str, ...]) -> str:
+    """Return the feature column name for a key set.
+
+    Args:
+        keys: The key columns, e.g. ("Flight Distance", "Age").
+
+    Returns:
+        `te_Flight Distance|Age` style, matching the reference codebook.
+    """
+    # Match the reference column-naming exactly (FD is their alias for Flight
+    # Distance), so our numbers compare without a rename pass through the results.
+    alias = {"Flight Distance": "FD"}
+    prefixes = [alias.get(k, k[:6]) for k in keys]
+    return "te_" + "|".join(prefixes)
+
+
+def add_target_encodings(
+    frame: pd.DataFrame,
+    train_frame: pd.DataFrame,
+    keys: tuple[str, ...],
+    target_column: str,
+    smoothing: float,
+    use_oof: bool,
+    seed: int,
+    folds: int = 5,
+) -> pd.Series:
+    """Append one target-encoded column for a key set.
+
+    Args:
+        frame: Rows to enrich.
+        train_frame: The rows the encoding is fitted on. Must be train.csv rows,
+            because train rows must be encoded out-of-fold.
+        keys: The grouping columns.
+        target_column: The label.
+        smoothing: Blend weight toward the prior, matching the reference (20.0).
+        use_oof: If True, each row's value comes from the other folds only. Use
+            True for train_frame, False for every other frame.
+        seed: Random seed for the inner fold.
+        folds: Five, matching the rest of the project.
+
+    Returns:
+        The encoded values as a float64 Series, in row order.
+    """
+    prior = float(train_frame[target_column].mean())
+
+    def _map_one(fit_frame: pd.DataFrame, apply_keys: pd.Series) -> pd.Series:
+        grouped = pd.DataFrame(
+            {"k": _composite(fit_frame, keys), "y": fit_frame[target_column]}
+        )
+        agg = grouped.groupby("k")["y"].agg(["sum", "count"])
+        enc = (agg["sum"] + prior * smoothing) / (agg["count"] + smoothing)
+        return apply_keys.map(enc).fillna(prior)
+
+    if use_oof:
+        from sklearn.model_selection import StratifiedKFold
+
+        out = pd.Series(index=frame.index, dtype=float)
+        labels = train_frame[target_column]
+        splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+        for fitting_index, scoring_index in splitter.split(train_frame, labels):
+            fitting = train_frame.iloc[fitting_index]
+            scoring = frame.iloc[scoring_index]
+            out.iloc[scoring_index] = _map_one(
+                fitting, _composite(scoring, keys)
+            ).to_numpy()
+        return out
+
+    return _map_one(train_frame, _composite(frame, keys)).astype(float)
+
+
+def add_target_encodings_to_all(
+    enriched_frames: dict[str, pd.DataFrame], config: DataCleaningConfig
+) -> dict[str, pd.DataFrame]:
+    """Add the six route/target-encoding columns to every frame.
+
+    Args:
+        enriched_frames: The four frames, keyed by split. Train must carry the label.
+        config: Gives the seed and the smoothing default.
+
+    Returns:
+        The four frames with `te_...` columns appended.
+
+    Note:
+    Train gets out-of-fold values; the other three take the full-train mapping.
+    Six keys, six columns. The FD-only key already exists as
+    route_target_encoded from the route block; we keep both because the fold-safe
+    validation shows FD-only being redundant with the route stat, but the
+    multi-column keys add information one column cannot express.
+    """
+    smoothing = config.route_smoothing
+    train_frame = enriched_frames["train"]
+    for keys in TE_COLUMNS:
+        column_name = target_encoding_column_name(keys)
+        enriched_frames["train"][column_name] = add_target_encodings(
+            train_frame,
+            train_frame,
+            keys,
+            config.target_column,
+            smoothing,
+            True,
+            config.random_seed,
+        )
+        for name in ("validation", "test", "competition"):
+            enriched_frames[name][column_name] = add_target_encodings(
+                enriched_frames[name],
+                train_frame,
+                keys,
+                config.target_column,
+                smoothing,
+                False,
+                config.random_seed,
+            )
+        log_step("target_encoding", column=column_name, smoothing=smoothing)
+    return enriched_frames
+
+
 def add_route_features_to_all(
     enriched_frames: dict[str, pd.DataFrame], config: DataCleaningConfig
 ) -> dict[str, pd.DataFrame]:
@@ -414,6 +610,13 @@ def add_route_features_to_all(
     )
     # Flight Distance IS the route key, so it profiles everything except itself.
     numeric_columns = [c for c in numeric_columns if c != "Flight Distance"]
+
+    count_columns = list(config.continuous_columns)
+    counts = {c: enriched_frames["train"][c].value_counts() for c in count_columns}
+    enriched_frames = {
+        name: add_value_counts(frame, counts) for name, frame in enriched_frames.items()
+    }
+    log_step("value_counts", columns=len(count_columns))
 
     train_frame = enriched_frames["train"]
     route_table, global_means, global_rate = build_route_table(
@@ -457,45 +660,90 @@ def add_route_features_to_all(
 
 
 def aux_feature_names(rating_columns: list[str]) -> list[str]:
-    """Return the deterministic names of the auxiliary-task features.
+    """Return the deterministic names of the 30 auxiliary-task features.
 
     Args:
         rating_columns: The 13 service ratings.
 
     Returns:
-        One `expected_<rating>` per rating, in the same order.
+        16 `aux_p_<target>` (the model's probability of the row's own value),
+        13 `aux_ev_<rating>` (the model's expected value for that rating), and
+        `aux_sum_logp`. Thirty columns, in that order.
     """
-    return [f"expected_{column}" for column in rating_columns]
+    names = [f"aux_p_{column}" for column in AUX_TARGETS]
+    names += [f"aux_ev_{column}" for column in rating_columns]
+    return names + ["aux_sum_logp"]
+
+
+def _aux_codes(frame: pd.DataFrame, categories: dict[str, list[str]]) -> pd.DataFrame:
+    """Integer-code the raw columns the auxiliary models read.
+
+    Args:
+        frame: Rows to code.
+        categories: Column name to its allowed values, fixed from the train split
+            so every frame codes identically.
+
+    Returns:
+        A frame holding only CANDIDATE_FEATURE_COLUMNS, with the four
+        categoricals as integer codes and everything else as-is.
+    """
+    coded = pd.DataFrame(index=frame.index)
+    for column in CANDIDATE_FEATURE_COLUMNS:
+        if column in categories:
+            coded[column] = pd.Categorical(
+                frame[column], categories=categories[column]
+            ).codes
+        else:
+            coded[column] = frame[column]
+    return coded
 
 
 def fit_auxiliary_models(
     train_frame: pd.DataFrame,
     rating_columns: list[str],
-    other_columns: list[str],
+    categories: dict[str, list[str]],
     seed: int,
 ) -> dict[str, object]:
-    """Fit one small model per rating, predicting it from the other columns.
+    """Fit one small model per auxiliary target, predicting it from the rest.
 
     Args:
         train_frame: Training rows.
-        rating_columns: The 13 ratings to predict, one model each.
-        other_columns: The inputs. Every column except the one being predicted
-            and the label, so no rating ever predicts itself.
+        rating_columns: The 13 ratings, which also get an expected-value column.
+        categories: Column name to allowed values, for integer-coding.
         seed: Random seed.
 
     Returns:
-        Rating name to fitted model. Small HistGradientBoosting, 100 trees -
-        these are features, not the final model, so they are kept fast.
-    """
-    from sklearn.ensemble import HistGradientBoostingClassifier
+        Target name to (model, inputs).
 
+    Note:
+    The predictors read only CANDIDATE_FEATURE_COLUMNS - the 21 raw columns, minus
+    the one being predicted. Not the engineered features. The reference measured
+    twelve variants of this and the rule was consistent: an expected value helps
+    exactly when it comes from the other 20 raw columns and nothing else. Feeding
+    it the route profile or the target encodings makes it worse than not having it,
+    because the extra information overlaps what the label model already knows.
+    """
+    from xgboost import XGBClassifier
+
+    coded = _aux_codes(train_frame, categories)
     models: dict[str, object] = {}
-    for column in rating_columns:
-        inputs = [c for c in other_columns if c != column]
-        model = HistGradientBoostingClassifier(max_iter=100, random_state=seed)
-        # Ratings are 0-5 integers. Treat as classes so predict_proba gives an
-        # expected value rather than a point prediction.
-        model.fit(train_frame[inputs], train_frame[column].astype(int))
+    for column in AUX_TARGETS:
+        inputs = [c for c in CANDIDATE_FEATURE_COLUMNS if c != column]
+        codes, _ = _aux_codes_and_values(coded[column])
+        objective = (
+            "binary:logistic" if len(np.unique(codes)) <= 2 else "multi:softprob"
+        )
+        model = XGBClassifier(
+            n_estimators=300,
+            learning_rate=0.1,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.7,
+            tree_method="hist",
+            objective=objective,
+            random_state=seed,
+        )
+        model.fit(coded[inputs], codes)
         models[column] = (model, inputs)
     return models
 
@@ -503,122 +751,235 @@ def fit_auxiliary_models(
 def apply_auxiliary_features(
     frame: pd.DataFrame,
     aux_models: dict[str, object],
-    use_oof_frame: pd.DataFrame | None,
-    oof_predictions: dict[str, pd.Series] | None,
+    rating_columns: list[str],
+    categories: dict[str, list[str]],
+    precomputed: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    """Add the expected value of each rating to any frame.
+    """Add the 30 auxiliary-task columns to any frame.
 
     Args:
         frame: Rows to enrich.
-        aux_models: Rating name to (model, inputs), from fit_auxiliary_models.
-        use_oof_frame: If this frame IS the training frame, pass it here along
-            with oof_predictions so train rows get out-of-fold values.
-        oof_predictions: Rating name to OOF expected values for train rows, or
-            None to predict directly (for validation, test, competition).
+        aux_models: Target name to (model, inputs), from fit_auxiliary_models.
+        rating_columns: The 13 ratings that also get an expected-value column.
+        categories: Column name to allowed values, for integer-coding.
+        precomputed: For the training frame, the out-of-fold values, already
+            assembled with the same column names. When given, nothing is fitted
+            here and these values are used verbatim.
 
     Returns:
-        A new frame with one `expected_<rating>` column per rating.
+        A new frame with the 30 auxiliary-task columns.
     """
+    import numpy as np
 
-    enriched = frame.copy()
+    order = aux_feature_names(rating_columns)
+    if precomputed is not None:
+        return pd.concat(
+            [
+                frame.reset_index(drop=True),
+                precomputed.reset_index(drop=True)[order],
+            ],
+            axis=1,
+        )
+
+    coded = _aux_codes(frame, categories)
+    own_values: list[np.ndarray] = []
+    out = frame.copy()
     for column, (model, inputs) in aux_models.items():
-        probabilities = model.predict_proba(frame[inputs])
-        classes = model.classes_
-        enriched[f"expected_{column}"] = (probabilities * classes).sum(axis=1)
-    if use_oof_frame is not None and oof_predictions is not None:
-        for column, values in oof_predictions.items():
-            enriched[f"expected_{column}"] = values.to_numpy()
-    return enriched
+        probabilities = np.asarray(model.predict_proba(coded[inputs]))
+        codes, values = _aux_codes_and_values(coded[column])
+        own = probabilities[np.arange(len(coded)), codes]
+        out[f"aux_p_{column}"] = own
+        own_values.append(own)
+        if column in rating_columns:
+            out[f"aux_ev_{column}"] = probabilities @ values
+    out["aux_sum_logp"] = np.log(np.clip(np.column_stack(own_values), 1e-6, 1)).sum(1)
+    # The out-of-fold path emits aux_p_* then aux_ev_*; the loop above interleaves
+    # them. Reindex so all four frames come out in the same order, or stage 2's
+    # column-order check rejects the build after an hour of fitting.
+    return pd.concat([frame, out[order]], axis=1)
+
+
+def _aux_codes_and_values(
+    series: pd.Series,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the target as contiguous 0..k-1 codes and its sorted values.
+
+    Args:
+        series: The target column for these rows.
+
+    Returns:
+        The codes (what the model is fitted on, because xgboost's sklearn API
+        rejects labels that do not start at 0) and the sorted distinct values
+        (what the expected value is computed against).
+    """
+    values = np.sort(series.dropna().unique().astype(float))
+    codes = np.searchsorted(values, series.to_numpy(dtype=float))
+    return codes, values
 
 
 def add_oof_auxiliary_predictions(
     train_frame: pd.DataFrame,
     rating_columns: list[str],
-    other_columns: list[str],
+    categories: dict[str, list[str]],
     seed: int,
     folds: int = 5,
-) -> dict[str, pd.Series]:
-    """Compute out-of-fold expected ratings for the training rows.
+) -> pd.DataFrame:
+    """Compute the 30 auxiliary-task columns out-of-fold for the training rows.
 
     Args:
         train_frame: Training rows.
-        rating_columns: The 13 ratings to predict.
-        other_columns: The inputs, excluding the label.
+        rating_columns: The 13 ratings.
+        categories: Column name to allowed values.
         seed: Random seed.
         folds: Five, matching the rest of the project.
 
     Returns:
-        Rating name to one expected value per training row, from models that
-        never saw that row.
+        A frame with the 30 columns, each row scored by models that never saw it.
     """
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import KFold
 
-    out: dict[str, pd.Series] = {
-        c: pd.Series(index=train_frame.index, dtype=float) for c in rating_columns
+    coded = _aux_codes(train_frame, categories)
+    blocks = {
+        f"aux_p_{column}": np.zeros(len(train_frame), dtype=np.float32)
+        for column in AUX_TARGETS
     }
-    splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
-    labels = train_frame["satisfaction"]
-    for fitting_index, scoring_index in splitter.split(train_frame, labels):
-        fitting = train_frame.iloc[fitting_index]
-        scoring = train_frame.iloc[scoring_index]
-        fold_models = fit_auxiliary_models(fitting, rating_columns, other_columns, seed)
-        for column, (model, inputs) in fold_models.items():
-            probabilities = model.predict_proba(scoring[inputs])
-            out[column].iloc[scoring_index] = (probabilities * model.classes_).sum(
-                axis=1
+    blocks.update(
+        {
+            f"aux_ev_{column}": np.zeros(len(train_frame), dtype=np.float32)
+            for column in rating_columns
+        }
+    )
+    blocks["aux_sum_logp"] = np.zeros(len(train_frame), dtype=np.float32)
+
+    own_all: list[np.ndarray] = []
+    for column in AUX_TARGETS:
+        inputs = [c for c in CANDIDATE_FEATURE_COLUMNS if c != column]
+        codes, values = _aux_codes_and_values(coded[column])
+        objective = (
+            "binary:logistic" if len(np.unique(codes)) <= 2 else "multi:softprob"
+        )
+        own_column = np.zeros(len(train_frame), dtype=np.float32)
+        for fitting_index, scoring_index in KFold(
+            folds, shuffle=True, random_state=0
+        ).split(coded):
+            from xgboost import XGBClassifier
+
+            model = XGBClassifier(
+                n_estimators=300,
+                learning_rate=0.1,
+                max_depth=6,
+                subsample=0.8,
+                colsample_bytree=0.7,
+                tree_method="hist",
+                objective=objective,
+                random_state=seed,
             )
-    return out
+            model.fit(coded.iloc[fitting_index][inputs], codes[fitting_index])
+            probabilities = np.asarray(
+                model.predict_proba(coded.iloc[scoring_index][inputs])
+            )
+            own = probabilities[np.arange(len(scoring_index)), codes[scoring_index]]
+            own_column[scoring_index] = own
+            if column in rating_columns:
+                blocks[f"aux_ev_{column}"][scoring_index] = probabilities @ values
+        blocks[f"aux_p_{column}"] = own_column
+        own_all.append(own_column)
+    blocks["aux_sum_logp"] = np.log(np.clip(np.column_stack(own_all), 1e-6, 1)).sum(1)
+    return pd.DataFrame(blocks)
+
+
+def twin_feature_names(numeric_columns: list[str]) -> list[str]:
+    """Return the deterministic names of the categorical twins.
+
+    Args:
+        numeric_columns: Every numeric column getting a twin.
+
+    Returns:
+        One `<column>_cat_` per numeric column, in the same order.
+    """
+    return [f"{column}_cat_" for column in numeric_columns]
+
+
+def add_categorical_twins(
+    frame: pd.DataFrame, numeric_columns: list[str]
+) -> pd.DataFrame:
+    """Add a categorical twin of every numeric column.
+
+    Args:
+        frame: Rows to enrich. Not modified.
+        numeric_columns: Columns to twin. Must all exist and be numeric.
+
+    Returns:
+        A new frame with one `<column>_cat_` category column per numeric column.
+
+    Note:
+    The twin is the value as an integer, then as a string, as a category. The
+    net learns an embedding per distinct value - per route, per age, per rating.
+    Deterministic and labelless: no fitting, no globals, nothing to leak. A
+    missing value would become the string "nan" and form its own category, which
+    is honest handling rather than imputation.
+    """
+    enriched = frame.copy()
+    for column in numeric_columns:
+        enriched[f"{column}_cat_"] = (
+            enriched[column].fillna(0).astype(int).astype(str).astype("category")
+        )
+    return enriched
 
 
 def add_auxiliary_features_to_all(
     enriched_frames: dict[str, pd.DataFrame], config: DataCleaningConfig
 ) -> dict[str, pd.DataFrame]:
-    """Add expected-rating columns to every frame from train-fitted models.
+    """Add the 30 auxiliary-task columns to every frame.
 
     Args:
         enriched_frames: The four frames, keyed by split. Train must carry the
             label; the others need not.
-        config: Says whether aux features are on, and gives the seed.
+        config: Gives the ratings list, the seed, and whether aux is on.
 
     Returns:
-        The four frames with one `expected_<rating>` column per rating.
+        The four frames with 16 `aux_p_`, 13 `aux_ev_` and `aux_sum_logp`.
 
     Note:
-    Each rating is predicted from every column except itself and the label, so no
-    rating ever predicts itself and the label never predicts anything. Train rows
-    get out-of-fold values. Every other frame gets predictions from models fitted
-    on the full train split. That separation is what prevents leakage.
+    Three column families, and they say different things. `aux_ev_<rating>` is the
+    model's expected value for that rating. `aux_p_<target>` is the probability it
+    assigns to the value the row actually has, so it measures how self-consistent
+    the row is. `aux_sum_logp` adds up those probabilities in log space across all
+    16 targets, which is one number for "how surprising is this row".
+
+    Train rows get out-of-fold values, so no training row is ever scored by a
+    model that saw it. Every other frame is scored by models fitted on the full
+    train split. That separation is the whole of the leakage protection.
     """
     rating_columns = list(config.service_rating_columns)
-    # Numeric columns only. The categoricals are still raw strings at this point -
-    # encoding happens after this step - and HistGradientBoosting cannot read them.
-    # Ratings are predicted almost entirely by other ratings in any case, so nothing
-    # meaningful is lost. Documented rather than worked around.
-    numeric_dtypes = {"int64", "float64", "bool"}
-    other_columns = [
-        c
-        for c in enriched_frames["train"].columns
-        if c not in rating_columns + [config.target_column, "id"]
-        and str(enriched_frames["train"][c].dtype) in numeric_dtypes
-    ]
+
+    # Fix each categorical's allowed values from the train split, so the train,
+    # validation, test and competition frames all encode a category identically.
+    categories = {
+        column: sorted(
+            enriched_frames["train"][column].dropna().astype(str).unique().tolist()
+        )
+        for column in CATEGORICAL_COLUMNS
+    }
 
     train_frame = enriched_frames["train"]
     aux_models = fit_auxiliary_models(
-        train_frame, rating_columns, other_columns, config.random_seed
+        train_frame, rating_columns, categories, config.random_seed
     )
-    oof_predictions = add_oof_auxiliary_predictions(
-        train_frame, rating_columns, other_columns, config.random_seed
+    oof_values = add_oof_auxiliary_predictions(
+        train_frame, rating_columns, categories, config.random_seed
     )
-    log_step("aux_models", models=len(aux_models), inputs_per_model=len(other_columns))
+    log_step("aux_models", models=len(aux_models), inputs_per_model=20)
 
     out: dict[str, pd.DataFrame] = {}
     for name, frame in enriched_frames.items():
-        if name == "train":
-            out[name] = apply_auxiliary_features(
-                frame, aux_models, frame, oof_predictions
-            )
-        else:
-            out[name] = apply_auxiliary_features(frame, aux_models, None, None)
+        out[name] = apply_auxiliary_features(
+            frame,
+            aux_models,
+            rating_columns,
+            categories,
+            oof_values if name == "train" else None,
+        )
     log_step("aux_features", added=len(aux_feature_names(rating_columns)))
     return out
 
@@ -764,9 +1125,26 @@ def build_everything(
 
     if config.route_features_enabled:
         enriched_frames = add_route_features_to_all(enriched_frames, config)
+        enriched_frames = add_target_encodings_to_all(enriched_frames, config)
 
     if config.aux_features_enabled:
         enriched_frames = add_auxiliary_features_to_all(enriched_frames, config)
+
+    if config.categorical_twins_enabled:
+        # Deterministic per-frame transform: no fitting, no globals, nothing shared
+        # between frames, so each frame is twinned independently. Must run BEFORE
+        # encoding, because the twins themselves are categorical columns.
+        for name, frame in enriched_frames.items():
+            numeric_columns = [
+                c
+                for c in frame.columns
+                if c
+                not in list(config.categorical_columns)
+                + [config.target_column, "id", "arrival_delay_status"]
+                and str(frame[c].dtype) in ("int64", "float64")
+            ]
+            enriched_frames[name] = add_categorical_twins(frame, numeric_columns)
+        log_step("categorical_twins", added=len(numeric_columns))
 
     prepared: dict[str, pd.DataFrame] = {}
     for name, frame in enriched_frames.items():

@@ -125,14 +125,22 @@ def test_score_model_returns_all_five_metrics() -> None:
     assert all(0.0 <= value <= 1.0 for value in scores.values())
 
 
-def test_native_encoding_is_only_valid_for_xgboost() -> None:
+def test_native_encoding_is_only_valid_for_models_that_read_categories() -> None:
     """A scikit-learn model cannot read `category` dtype, and must say so clearly.
 
     The message matters: without it the failure surfaces as a dtype error inside
     fit(), which points at the model rather than at the config setting.
     """
-    with pytest.raises(ValueError, match="Only xgboost can read"):
+    with pytest.raises(ValueError, match="Only .* can read"):
         build_model("logistic_regression", {}, seed=42, categorical_encoding="native")
+
+
+def test_native_encoding_is_valid_for_realmlp() -> None:
+    """RealMLP embeds categories internally, so native encoding is fine for it."""
+    model = build_model(
+        "realmlp", {"n_ens": 1, "n_epochs": 1}, seed=42, categorical_encoding="native"
+    )
+    assert type(model).__name__ == "RealMLP_TD_Classifier"
 
 
 def test_native_encoding_adds_enable_categorical_for_xgboost() -> None:
