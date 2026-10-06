@@ -45,12 +45,12 @@ OUT_DIR = Path("research/members")
 # ls_eps (0.1 by default, 0.01 here).
 TUNED = {
     "batch_size": 256,
-    # pytabkit leaves this None, which means one thread for the CPU-side tfms
-    # (median_center, robust_scale, smooth_clip). Those run per batch on numpy,
-    # so a single thread leaves the GPU idle waiting for data. Measured on
-    # Kaggle: 69% and 38% utilisation with n_threads unset. This is the knob for
-    # that, and it changes no arithmetic, so no accuracy effect.
-    "n_threads": 8,
+    # n_threads is deliberately absent. Measured on 120k real rows, 2 epochs,
+    # best of three: unset 20.6s, =4 22.5s, =8 30.5s, =1 33.2s. pytabkit's
+    # default is fastest because the tfms are already vectorised numpy, so
+    # threading adds sync overhead. Do not add it on the strength of a GPU
+    # utilisation reading; that number is kernel-launch bound at this net size,
+    # not a CPU-side starvation problem.
     "use_early_stopping": False,
     "lr": 0.053,
     "wd": 0.0236,
@@ -363,7 +363,27 @@ def fit_one(estimator, X: pd.DataFrame, y: pd.Series, categorical: list[str]):
             cat_dims=cat_sizes,
             cat_emb_dim=1,
         )
-        fresh.fit(Xn, yn, patience=3, max_epochs=20, batch_size=4096)
+        # TabNet only early-stops if it is given something to stop on. Without
+        # an eval_set, patience is a no-op and all 20 epochs run blind: that
+        # cost 2892s for one member and scored it 0.0034 below LightGBM. So carve
+        # a validation slice out of the FIT rows only - never the scored fold,
+        # or early stopping would be selecting on the rows we then score.
+        from sklearn.model_selection import train_test_split
+
+        inner_fit, inner_val = train_test_split(
+            np.arange(len(yn)),
+            test_size=0.1,
+            random_state=42,
+            stratify=yn,
+        )
+        fresh.fit(
+            Xn[inner_fit],
+            yn[inner_fit],
+            eval_set=[(Xn[inner_val], yn[inner_val])],
+            patience=5,
+            max_epochs=40,
+            batch_size=4096,
+        )
         return fresh
     try:
         estimator.fit(X, y, cat_col_names=categorical)
@@ -477,6 +497,11 @@ def run_member(
             f"  {name} fold {fold + 1}/{folds} done ({time.time() - started:.0f}s)",
             flush=True,
         )
+        # Checkpoint after every fold. A TabM run was killed at fold 8/10 and, with
+        # the write only at the end, that was 40 minutes of GPU time discarded.
+        # Scoring the folds that did finish is possible; scoring nothing is not.
+        np.save(OUT_DIR / f"oof_{name}.partial.npy", oof)
+        np.save(OUT_DIR / f"test_{name}.partial.npy", test)
     auc = float(roc_auc_score(y, oof))
     np.save(OUT_DIR / f"oof_{name}.npy", oof)
     np.save(OUT_DIR / f"test_{name}.npy", test)

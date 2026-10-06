@@ -110,3 +110,29 @@ def test_a_few_blanks_are_allowed() -> None:
     frame.loc[:0, "Arrival Delay in Minutes"] = None
 
     check_missing_values_are_reasonable("train.csv", frame)
+
+
+def test_ambiguous_kaggle_mount_is_an_error_not_a_guess(tmp_path, monkeypatch) -> None:
+    """Two mounted train.csv files must stop the run, not be decided by sort order.
+
+    Kaggle mounts one directory per attached dataset, and more than one of them
+    can hold a train.csv. The previous resolver returned the first hit from a
+    sorted glob, so the answer depended on alphabetical order of the paths - no
+    error, just a different dataset and a different score. Anything that could
+    silently read the wrong competition data has to raise instead.
+    """
+    from src.utils import common
+
+    first = tmp_path / "competitions" / "playground-series-s6e10"
+    second = tmp_path / "datasets" / "anishjagdaleaj" / "s6e10"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "train.csv").write_text("a,b\n1,2\n")
+    (second / "train.csv").write_text("a,b\n3,4\n")
+    monkeypatch.setattr(common, "KAGGLE_INPUT_DIRS", (tmp_path,))
+
+    with pytest.raises(FileNotFoundError, match="mounted in 2 places"):
+        common.find_kaggle_file("train.csv")
+
+    assert common.find_kaggle_file("train.csv", second) == second / "train.csv"
+    assert common.find_kaggle_file("data.csv", second) is None

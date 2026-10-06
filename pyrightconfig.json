@@ -1,0 +1,7 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["src", "tests", "research", "run_pipeline.py"],
+  "reportMissingImports": "error",
+  "reportMissingTypeStubs": "none"
+}

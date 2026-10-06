@@ -13,6 +13,7 @@ from typing import Any
 
 import yaml
 
+from src.components.ensemble import EnsembleConfig, MemberSpec
 from src.constants import (
     CANDIDATE_FEATURE_COLUMNS,
     CATEGORICAL_COLUMNS,
@@ -53,12 +54,17 @@ def resolve_project_path(raw: str | Path) -> Path:
     return find_project_root() / path
 
 
-def resolve_data_file(raw: str | Path, description: str) -> Path:
+def resolve_data_file(
+    raw: str | Path, description: str, preferred_root: str | Path | None = None
+) -> Path:
     """Return the data file to read, from the project tree or Kaggle.
 
     Args:
         raw: The value from config.yaml.
         description: What the file is, used in the error message.
+        preferred_root: A Kaggle dataset directory to search before the general
+            mounts. Without it, two mounted datasets both holding train.csv make
+            the result depend on alphabetical order.
 
     Returns:
         The file to read.
@@ -74,7 +80,7 @@ def resolve_data_file(raw: str | Path, description: str) -> Path:
     path = resolve_project_path(raw)
     if path.exists():
         return path
-    found = find_kaggle_file(path.name)
+    found = find_kaggle_file(path.name, preferred_root)
     if found is not None:
         get_logger().warning(
             "%s not found at %s. Using Kaggle input %s instead.",
@@ -182,6 +188,17 @@ class PipelineConfigReader:
             )
         return encoding
 
+    @property
+    def kaggle_dataset_path(self) -> str | None:
+        """The Kaggle dataset directory to prefer, from config.yaml.
+
+        Returns:
+            The configured path, or None when the local tree already holds the
+            files or the key is absent.
+        """
+        raw = self.config.get("kaggle_dataset_path")
+        return str(raw) if raw else None
+
     def create_ingestion_config(self) -> DataIngestionConfig:
         """Return the settings stage 1 needs.
 
@@ -196,11 +213,14 @@ class PipelineConfigReader:
         required = frozenset(CANDIDATE_FEATURE_COLUMNS) | frozenset({TARGET_COLUMN})
         return DataIngestionConfig(
             data_path=resolve_data_file(
-                require_key(self.config, "data_path"), "Training data"
+                require_key(self.config, "data_path"),
+                "Training data",
+                self.kaggle_dataset_path,
             ),
             competition_test_path=resolve_data_file(
                 require_key(self.config, "competition_test_path"),
                 "Competition test data",
+                self.kaggle_dataset_path,
             ),
             artifacts_dir=resolve_project_path(
                 require_key(self.config, "artifacts_path")
@@ -321,6 +341,7 @@ class PipelineConfigReader:
             sample_submission_path=resolve_data_file(
                 require_key(self.config, "sample_submission_path"),
                 "Submission template",
+                self.kaggle_dataset_path,
             ),
             model_path=model_dir / "model.pkl",
             features_path=model_dir / "features.json",
@@ -331,6 +352,42 @@ class PipelineConfigReader:
             / f"model_{model_version}",
             submission_dir=resolve_project_path(require_key(self.config, "report_path"))
             / "submissions",
+        )
+
+    def create_ensemble_config(self) -> EnsembleConfig:
+        """Return the ensemble settings from config.yaml.
+
+        Returns:
+            An EnsembleConfig, disabled when the block is absent or off.
+
+        Note:
+        Defaults to disabled rather than raising. A config without an ensemble
+        block is a config that wants the single-model path, which is the
+        behaviour that predates this feature and is covered by the other tests.
+        """
+        block = self.config.get("ensemble") or {}
+        if not isinstance(block, dict):
+            block = {}
+        members = [
+            MemberSpec(
+                name=str(entry["name"]),
+                kind=str(entry["kind"]),
+                params=dict(entry.get("params") or {}),
+                drop_prefix=tuple(entry.get("drop_prefix") or ()),
+                drop_suffix=tuple(entry.get("drop_suffix") or ()),
+                target_encodings=bool(entry.get("target_encodings", True)),
+            )
+            for entry in (block.get("members") or [])
+        ]
+        return EnsembleConfig(
+            enabled=bool(block.get("enabled", False)),
+            members=members,
+            folds=int(block.get("folds", 10)),
+            seed=int(block.get("seed", 42)),
+            device=str(block.get("device", "cpu")),
+            stack_C=float(block.get("stack_C", 1.0)),
+            te_columns=[str(c) for c in (block.get("te_columns") or [])],
+            combiner=str(block.get("combiner", "logistic")),
         )
 
     def create_pipeline_config(self, model_version: int = 1) -> PipelineConfig:

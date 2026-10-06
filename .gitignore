@@ -16,3 +16,5 @@ __pycache__/
 *.md
 data/
 .json
+# CatBoost writes this on every GPU/CPU fit; it is a run artifact, not source.
+catboost_info/

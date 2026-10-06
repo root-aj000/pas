@@ -61,7 +61,16 @@ def load_members(
         and the matching test matrix.
     """
     if names is None:
-        names = sorted(p.stem[4:] for p in members_dir.glob("oof_*.npy"))
+        # Exclude .partial on purpose. run_member checkpoints every fold, so a
+        # partial file exists for every in-flight member, and its unscored rows
+        # are still zeros. Globbing "oof_*.npy" picks it up as a member named
+        # "<name>.partial" and stacks a half-empty array into the result - a
+        # silent corruption with no error anywhere.
+        names = sorted(
+            p.stem[4:]
+            for p in members_dir.glob("oof_*.npy")
+            if not p.stem.endswith(".partial")
+        )
     missing = [
         n
         for n in names
@@ -156,6 +165,23 @@ def main() -> None:
     y = pd.read_csv(artifacts / "train.csv", usecols=["satisfaction"])[
         "satisfaction"
     ].to_numpy()
+
+    roster_path = members_dir / "roster.csv"
+    if roster_path.exists():
+        roster = pd.read_csv(roster_path)
+        counts = {
+            str(r["member"]): r["folds"]
+            for _, r in roster.iterrows()
+            if "folds" in roster
+        }
+        seen = {n: counts[n] for n in names if n in counts}
+        if len(set(seen.values())) > 1:
+            print("WARNING: members cross-validated with different fold counts:")
+            for name, folds in sorted(seen.items()):
+                print(f"  {name:24s} folds={folds}")
+            print("  Mixing is arithmetically legal - every row is still out of")
+            print("  fold - but the weaker-folded members carry less signal.")
+            print()
 
     print("=== members, scored out-of-fold on the training rows ===")
     solo = []

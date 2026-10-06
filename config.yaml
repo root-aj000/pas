@@ -17,6 +17,11 @@ data_path: "data/train.csv"
 competition_test_path: "data/test.csv"
 sample_submission_path: "data/sample_submission.csv"
 
+# On Kaggle, /kaggle/input holds several mounts and more than one of them can
+# contain a train.csv. Naming the dataset we mean removes the guess: the reader
+# prefers this directory, and only falls back to scanning when it is absent.
+kaggle_dataset_path: "/kaggle/input/datasets/anishjagdaleaj/s6e10"
+
 artifacts_path: "artifacts"
 models_path: "models"
 report_path: "reports"
@@ -157,6 +162,96 @@ features:
   - "cnt_Flight Distance"
   - "cnt_Departure Delay in Minutes"
   - "cnt_Arrival Delay in Minutes"
+  - "routediff_Inflight wifi service"
+  - "routediff_Departure/Arrival time convenient"
+  - "routediff_Ease of Online booking"
+  - "routediff_Gate location"
+  - "routediff_Food and drink"
+  - "routediff_Online boarding"
+  - "routediff_Seat comfort"
+  - "routediff_Inflight entertainment"
+  - "routediff_On-board service"
+  - "routediff_Leg room service"
+  - "routediff_Baggage handling"
+  - "routediff_Checkin service"
+  - "routediff_Cleanliness"
+  - "routediff_Age"
+  - "routediff_Departure Delay in Minutes"
+  - "routediff_Arrival Delay in Minutes"
+  - "Age_d-4"
+  - "Age_d-3"
+  - "Age_d-2"
+  - "Age_d-1"
+  - "Age_d0"
+  - "Age_d1"
+  - "Age_d2"
+  - "Age_d3"
+  - "Flight Distance_d-4"
+  - "Flight Distance_d-3"
+  - "Flight Distance_d-2"
+  - "Flight Distance_d-1"
+  - "Flight Distance_d0"
+  - "Flight Distance_d1"
+  - "Flight Distance_d2"
+  - "Flight Distance_d3"
+  - "Departure Delay in Minutes_d-4"
+  - "Departure Delay in Minutes_d-3"
+  - "Departure Delay in Minutes_d-2"
+  - "Departure Delay in Minutes_d-1"
+  - "Departure Delay in Minutes_d0"
+  - "Departure Delay in Minutes_d1"
+  - "Departure Delay in Minutes_d2"
+  - "Departure Delay in Minutes_d3"
+  - "Arrival Delay in Minutes_d-4"
+  - "Arrival Delay in Minutes_d-3"
+  - "Arrival Delay in Minutes_d-2"
+  - "Arrival Delay in Minutes_d-1"
+  - "Arrival Delay in Minutes_d0"
+  - "Arrival Delay in Minutes_d1"
+  - "Arrival Delay in Minutes_d2"
+  - "Arrival Delay in Minutes_d3"
+  - "freq_Inflight wifi service"
+  - "rarity_Inflight wifi service"
+  - "freq_Departure/Arrival time convenient"
+  - "rarity_Departure/Arrival time convenient"
+  - "freq_Ease of Online booking"
+  - "rarity_Ease of Online booking"
+  - "freq_Gate location"
+  - "rarity_Gate location"
+  - "freq_Food and drink"
+  - "rarity_Food and drink"
+  - "freq_Online boarding"
+  - "rarity_Online boarding"
+  - "freq_Seat comfort"
+  - "rarity_Seat comfort"
+  - "freq_Inflight entertainment"
+  - "rarity_Inflight entertainment"
+  - "freq_On-board service"
+  - "rarity_On-board service"
+  - "freq_Leg room service"
+  - "rarity_Leg room service"
+  - "freq_Baggage handling"
+  - "rarity_Baggage handling"
+  - "freq_Checkin service"
+  - "rarity_Checkin service"
+  - "freq_Cleanliness"
+  - "rarity_Cleanliness"
+  - "freq_Age"
+  - "rarity_Age"
+  - "freq_Flight Distance"
+  - "rarity_Flight Distance"
+  - "freq_Departure Delay in Minutes"
+  - "rarity_Departure Delay in Minutes"
+  - "freq_Arrival Delay in Minutes"
+  - "rarity_Arrival Delay in Minutes"
+  - "freq_Gender"
+  - "rarity_Gender"
+  - "freq_Customer Type"
+  - "rarity_Customer Type"
+  - "freq_Type of Travel"
+  - "rarity_Type of Travel"
+  - "freq_Class"
+  - "rarity_Class"
 
 # --- The split ---------------------------------------------------------------
 # Frozen. See docs/split_plan.md for why a random stratified split is correct
@@ -367,3 +462,192 @@ max_training_seconds: 3600
 # NOTE BEFORE YOUR FIRST GPU RUN: check it against 0.954479 test ROC-AUC, the
 # number the CPU produced. A silent GPU/CPU divergence is the kind of thing nobody
 # notices for a week.
+
+# --- The ensemble ------------------------------------------------------------
+# Stage 5 trains every member with the same folds and stacks their logits with a
+# logistic regression. Enabling this skips stages 3 and 4, so a run produces one
+# submission instead of two.
+ensemble:
+  enabled: true
+  folds: 10
+  seed: 42
+  # auto -> cuda when a GPU is visible, cpu otherwise. One committed value has
+  # to be right on a laptop and on a 2x T4 Kaggle session; a fixed "cpu"
+  # silently trains everything on the processor and a fixed "cuda" crashes
+  # locally. With more than one GPU, members are dealt round-robin across
+  # them, one worker process per device.
+  device: auto
+  stack_C: 1.0
+  members:
+  - name: lightgbm
+    kind: lightgbm
+    params:
+      n_estimators: 1000
+      learning_rate: 0.05
+      num_leaves: 100
+      max_bin: 255
+      subsample: 0.7
+      colsample_bytree: 0.7
+      n_jobs: 8
+  - name: realmlp_tuned
+    kind: realmlp
+    # No in-fold encodings: these members see every column at once, and
+    # 31 extra encodings of columns still sitting beside them is more
+    # of the same signal than a network can use. See MemberSpec.
+    target_encodings: false
+    params:
+      n_ens: 8
+      n_epochs: 6
+      batch_size: 256
+      use_early_stopping: false
+      lr: 0.053
+      wd: 0.0236
+      sq_mom: 0.988
+      lr_sched: flat_anneal
+      wd_sched: cos_log_15
+      first_layer_lr_factor: 0.25
+      embedding_size: 5
+      max_one_hot_cat_size: 18
+      hidden_sizes: &id001
+      - 512
+      - 256
+      - 128
+      act: silu
+      p_drop: 0.05
+      p_drop_sched: expm4t
+      plr_hidden_1: 16
+      plr_hidden_2: 8
+      plr_act_name: gelu
+      plr_lr_factor: 0.1151
+      plr_sigma: 2.33
+      ls_eps: 0.01
+      ls_eps_sched: sqrt_cos
+      add_front_scale: false
+      bias_init_mode: neg-uniform-dynamic-2
+      tfms: &id002
+      - one_hot
+      - median_center
+      - robust_scale
+      - smooth_clip
+      - embedding
+      - l2_normalize
+      n_refit: 1
+      val_fraction: 0.2
+  - name: realmlp_lowbudget
+    kind: realmlp
+    # No in-fold encodings: these members see every column at once, and
+    # 31 extra encodings of columns still sitting beside them is more
+    # of the same signal than a network can use. See MemberSpec.
+    target_encodings: false
+    params:
+      batch_size: 256
+      use_early_stopping: false
+      lr: 0.053
+      wd: 0.0236
+      sq_mom: 0.988
+      lr_sched: flat_anneal
+      wd_sched: cos_log_15
+      first_layer_lr_factor: 0.25
+      embedding_size: 5
+      max_one_hot_cat_size: 18
+      hidden_sizes: *id001
+      act: silu
+      p_drop: 0.05
+      p_drop_sched: expm4t
+      plr_hidden_1: 16
+      plr_hidden_2: 8
+      plr_act_name: gelu
+      plr_lr_factor: 0.1151
+      plr_sigma: 2.33
+      ls_eps: 0.01
+      ls_eps_sched: sqrt_cos
+      add_front_scale: false
+      bias_init_mode: neg-uniform-dynamic-2
+      tfms: *id002
+      n_ens: 3
+      n_epochs: 4
+      n_refit: 1
+      val_fraction: 0.2
+  - name: xgboost
+    kind: xgboost
+    params:
+      n_estimators: 1200
+      learning_rate: 0.05
+      max_depth: 8
+      min_child_weight: 5.0e-06
+      reg_lambda: 0.0
+      max_bin: 4096
+      subsample: 0.65
+      colsample_bylevel: 0.9
+      tree_method: hist
+      n_jobs: 8
+  - name: tabnet
+    kind: tabnet
+    # No in-fold encodings: these members see every column at once, and
+    # 31 extra encodings of columns still sitting beside them is more
+    # of the same signal than a network can use. See MemberSpec.
+    target_encodings: false
+    params: {}
+  - name: xgb_d10
+    kind: xgboost
+    params:
+      n_estimators: 1500
+      learning_rate: 0.02
+      max_depth: 10
+      colsample_bytree: 0.55
+      min_child_weight: 20
+      tree_method: hist
+      n_jobs: 8
+  - name: xgb_d9
+    kind: xgboost
+    params:
+      n_estimators: 1500
+      learning_rate: 0.02
+      max_depth: 9
+      colsample_bytree: 0.8
+      colsample_bynode: 0.5
+      min_child_weight: 55
+      tree_method: hist
+      n_jobs: 8
+  - name: lgb_deep
+    kind: lightgbm
+    params:
+      n_estimators: 1500
+      learning_rate: 0.02
+      num_leaves: 255
+      max_depth: 10
+      min_child_samples: 80
+      colsample_bytree: 0.5
+      n_jobs: 8
+  - name: cat_obl
+    kind: catboost
+    params:
+      iterations: 1500
+      learning_rate: 0.02
+      depth: 7
+      border_count: 254
+      l2_leaf_reg: 4.0
+  # Target encodings are fitted inside each training fold and applied to the
+  # held-out part, so no row ever sees its own label. See src/components/ensemble.py.
+  te_columns:
+  - Inflight wifi service
+  - Departure/Arrival time convenient
+  - Ease of Online booking
+  - Gate location
+  - Food and drink
+  - Online boarding
+  - Seat comfort
+  - Inflight entertainment
+  - On-board service
+  - Leg room service
+  - Baggage handling
+  - Checkin service
+  - Cleanliness
+  - Age
+  - Flight Distance
+  - Departure Delay in Minutes
+  - Arrival Delay in Minutes
+  - Gender
+  - Customer Type
+  - Type of Travel
+  - Class

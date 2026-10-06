@@ -453,3 +453,318 @@ What is running now: stage 2 is rebuilding the 100-feature artifacts (22 base +
 20 twins + 18 route + 6 TE + 30 aux + 4 value counts). The aux block costs ~80
 minutes of XGBoost fits; every selection experiment after that reuses the
 artifacts and costs no rebuild.
+
+## Runs 32-36 — the model zoo, and the first stack
+
+All selection numbers below are 10-fold `StratifiedKFold(5→10, shuffle=True,
+random_state=42)` out-of-fold AUC on the **training rows only**, the same split
+the reference notebook used. The validation and test splits were not read during
+selection.
+
+| Run | Member | Family | OOF AUC | Notes |
+|---|---|---|---|---|
+| 32 | xgboost | tree | 0.958789 | native categoricals, 70 features |
+| 33 | lightgbm | tree | **0.960032** | best single model |
+| 34 | realmlp_tuned | RealMLP | 0.959954 | tuned recipe, 8 members × 6 epochs, 70 features |
+| 35 | tabnet | TabNet | 0.956596 | weakest member, and still worth +0.00002 |
+| 36 | — | **logistic stack on member logits** | **0.961016** | nested CV, **public LB 0.96050** |
+
+### What the stack bought
+
+| Combination | OOF AUC |
+|---|---|
+| best single member (lightgbm) | 0.960032 |
+| mean of logits | 0.960950 |
+| logistic regression on logits, nested | **0.961016** |
+
+Greedy forward selection, judged by the same nested score:
+
+```
+lightgbm                    0.960028
++ realmlp_tuned             0.960771   +0.00074
++ realmlp_tuned_noaux       0.960902   +0.00013
++ xgboost                   0.960993   +0.00009
++ tabnet                    0.961016   +0.00002
+```
+
+**+0.00098 over the best single model.** Note the shape: the largest single
+contribution came from pairing a tree with a neural net, and the second largest
+from a neural net trained on a *different feature set*. Feature diversity paid;
+architecture diversity barely did. That is the same pattern the reference reports
+across six notebooks, and it is why the raw-input member is the next thing to try
+rather than more architectures.
+
+### Diversity, measured
+
+Spearman rank correlation between members, off-diagonal, ranged **0.887 to 0.965**.
+RealMLP↔XGBoost is 0.929. The reference measured ~0.98 between its own RealMLP
+and XGBoost, so these members are *more* different from each other than theirs
+were — which is why the stack moved as far as it did, and why the stack score
+0.961016 now sits within 0.00033 of their best single model (0.961344) without
+their original-data teacher.
+
+### OOF versus the leaderboard
+
+| | OOF | Public LB | Delta |
+|---|---|---|---|
+| Ours, 5-member stack | 0.961016 | **0.96050** | −0.00052 |
+| Reference, 38-member stack | 0.961744 | 0.96147 | −0.00027 |
+
+Same sign and magnitude. The reference reports public-LB noise on this competition
+at roughly 0.0005 - three submissions whose nested CV differed by 0.000005 scored
+0.96145, 0.96147 and 0.96146 - so a −0.00052 OOF-to-LB gap is inside the noise of
+the leaderboard rather than evidence of overfitting the out-of-fold scores.
+
+### Where the remaining gap is
+
+| Item | Size | Status |
+|---|---|---|
+| Original-data teacher logits (`og_xgb_d8`, `og_realmlp`) | ~+0.0008 | **Blocked.** Needs the 130k-row original competition file. Not downloadable without the Kaggle token. |
+| Raw-input RealMLP member (22 raw columns) | +0.00003 to +0.00007 each | Reachable. `--drop-prefix route_,te_,cnt_ --drop-suffix _cat_` |
+| Further architectures (TabM, MLP-PLR, FTT, ResNet, MLP-RTDL, XRFM) | ~+0.00002 each | Measured "too weak to use" by the reference. Not run: not worth ~2.5 GPU-hours. |
+
+### Two mistakes this log records
+
+1. **`n_threads=8` was recommended and then measured to be a 48% slowdown.**
+   Best of three on 120k real rows, 2 epochs: unset 20.6s, =4 22.5s, =8 30.5s,
+   =1 33.2s. pytabkit's default is fastest because the `tfms` are already
+   vectorised. The original reasoning - that a single-threaded CPU preprocessing
+   step was starving the GPU - was an explanation of a utilisation reading made
+   without measuring. The GPU figure of 69% is kernel-launch bound at this net
+   size, not a starvation problem. Removed from the code, with the measurement
+   recorded in `research/make_members.py` so it cannot be re-added.
+
+2. **TabNet ran with no `eval_set`, so `patience` was a no-op.** It ran all 20
+   epochs blind, costing 2892s and understating the member. Carried over from the
+   deleted pytorch-tabular wrapper without its inner validation split. Fixed by
+   carving a validation slice out of the fit rows only - never the scored fold,
+   which would make early stopping select on the rows it is scored against.
+
+## Run 32: the generated features were never actually being used
+
+The digit, frequency and route-residual blocks were written, wired into
+`add_route_features_to_all`, and logged by stage 2. None of them reached a model.
+
+`check_feature_list` asserts `config.features` is a subset of the encoded frame,
+because that is what stops a run dying on a missing column. It never checks the
+reverse, so a generated column nobody listed in `features` is dropped in silence.
+The last real artifact had 99 columns; the model was handed the 70 in the config.
+The run reported success and a plausible AUC.
+
+| Block | Names | Reference gain | Our status before this run |
+|---|---|---|---|
+| `routediff_*` | 17 | +0.000128 | generated, dropped |
+| `<col>_d-4..d3` | 32 | +0.000211 | generated, dropped |
+| `freq_*` / `rarity_*` | 41 | +0.000128 | generated, dropped |
+
+`config.features` now lists 160 columns. `tests/test_config_is_production.py`
+asserts the reverse direction too, and the test was confirmed to fail when the 90
+names are removed - a guard that cannot fail is not a guard.
+
+The digit block was verified against real rows rather than trusted: `Age = 36`
+gives `_d0 = 6` and `_d3 = 0`.
+
+### XGBoost `max_bin` 256 -> 4096
+
+The reference's fold-0 table shows `max_bin=4096` at 0.959747 against 0.958998 for
+their default. Ours was 256. Changed on the `xgboost` member; the two other XGBoost
+members never set it and keep their defaults.
+
+Note this is a single fold on their raw 21 columns. Ours trains on 160, where
+`max_bin` trades resolution against histogram size differently. Not yet measured
+here.
+
+### A third mistake: `git checkout config.yaml`
+
+Verifying the guard meant removing the 90 names to confirm the test bites. The
+recovery used `git checkout config.yaml`, which reverted the whole file - and the
+ensemble block, `kaggle_dataset_path` and the `max_bin` change were all uncommitted.
+Restored by hand and re-verified against the values recorded here: 160 features,
+9 members, 21 TE columns, `n_refit=1` on both RealMLP members, folds 10, seed 42.
+
+Full gate after the restore: 98 passed, ruff clean, mypy clean on 50 source files.
+
+**Commit this file before touching config.yaml again.** The repository has no
+backup for uncommitted work, and this is the second time the log has had to record
+a loss that a commit would have made free.
+
+## Run 33: five defects found by asking why one number was low
+
+The question was narrow - why is our RealMLP 0.959954 where the reference reaches
+0.961145 - and answering it turned up five defects, none of which the test suite
+could see. All of them produce a plausible number rather than an error.
+
+### 1. Stage 5 threw away 30% of the labelled rows
+
+`stage_05_ensemble.py` read only `artifacts/data_cleaning_encoding/train.csv`,
+489,743 rows, while the reference fits on all 699,635.
+
+| file | rows | read by stage 5 |
+|---|---|---|
+| train.csv | 489,743 | yes |
+| validation.csv | 104,946 | **no** |
+| test.csv | 104,946 | no |
+| **total labelled** | **699,635** | **489,743** |
+
+The cause is structural. Stage 2's 70/15/15 split was built for the single-model
+path, where the validation file gave stages 3 and 4 something to early-stop and
+select on. Stage 5 cross-validates internally and needs no held-out split, so
+that file stopped being read by anything - and the 15% went with it.
+
+Fixed by concatenating train and validation. Safe: stage 2 encoded both in one
+pass with identical columns and train-fitted statistics, its label-based columns
+were cross-fitted so a validation row's encoding never used its own label, and
+the fold structure that matters is created in stage 5.
+
+This is not a RealMLP problem. It applies to all nine members, and it is a better
+explanation for the trees being 0.0016 behind than the missing early stopping.
+
+### 2. `te_Age` existed twice in every member's input
+
+Stage 2 writes `te_Age`, `te_FD`, `te_FD|Age`. The in-fold block wrote
+`te_<column>`. For `Age` those are the same string, and `pd.concat` keeps both, so
+the merged frame carried two `te_Age` columns and every member silently received
+a duplicated input. Renamed to `tef_`. A test now checks name-disjointness
+against the real stage-2 naming function, so it cannot drift.
+
+### 3. The in-fold block recomputed half its own work
+
+A second `for column in columns:` loop after the main one re-encoded every scoring
+and competition row with expressions identical to the ones already evaluated.
+Pure waste; deleted.
+
+### 4. The neural members were handed a fifth of their input as encodings
+
+With the 160 configured features plus the in-fold block, a member saw 191 columns
+of which 38 (20%) were target encodings of columns still present beside them. The
+reference gives RealMLP six encoding keys out of ~72 (8%), and measured that
+crossing more of them overfits: *"Crossing Flight Distance with every other
+feature, or encoding rating combinations, overfits and is left out."*
+
+`MemberSpec.target_encodings` now gates the block per member. Off for the two
+RealMLP members and TabNet, on for the trees. **This one is a hypothesis, not a
+measurement** - it is the one change here that has to be scored, and it is a
+one-line revert in config.yaml.
+
+### 5. `predict_proba` returns one column, not two
+
+Worth recording because it cost an hour: pytabkit's `RealMLP_TD_Classifier`
+returns shape `(n, 1)`, so `predict_proba(X)[:, 1]` raises `IndexError`. Take
+`reshape(len(X), -1)[:, -1]`.
+
+### A false lead, recorded so it is not repeated
+
+A probe comparing RealMLP outputs across parameter changes reported every
+parameter as ignored - bit-identical predictions for `n_epochs`, `lr_sched`,
+`p_drop`, `hidden_sizes`, `lr`. All six were no-ops. The probe built its target
+with `(df.satisfaction == 'satisfied')`, and **our target is bool dtype, not
+strings** (`True`/`False`, positive rate 0.4436). The comparison was against
+nothing, so the model learned one class and returned 1.0 for every row, which is
+of course identical under every setting.
+
+With the target fixed, the same probe shows parameters behaving normally:
+`n_epochs` 2 to 12 moves AUC 0.954 to 0.970, `hidden_sizes` 512 gives 0.975.
+The earlier claim that the reference's flat hyper-parameter findings would not
+transfer to us was wrong, and was wrong because of the probe, not the model.
+
+### Still blocked on stage 2
+
+config.yaml lists 160 features; the artifacts on disk carry 99. Stage 2 has to be
+re-run before stage 5, and stage 5 now says so with a named column instead of a
+KeyError.
+
+## Run 34: full-pipeline audit before a Kaggle run
+
+Question: can `python run_pipeline.py` be trusted end to end, and does the
+submission appear before or after training? Answer: after, from stage 5 - and
+getting there turned up two more defects.
+
+### The submission is written by stage 5, and it is the only one
+
+`run_pipeline.py` treats the two paths as alternatives. `ensemble.enabled: true`
+means stages 3 and 4 are skipped with a logged reason, so nothing else writes a
+submission and nothing can overwrite stage 5's:
+
+```
+python run_pipeline.py
+  stage 01  ingest
+  stage 02  clean + encode          <- writes the artifacts
+  stage 03  SKIPPED (ensemble.enabled)
+  stage 04  SKIPPED (ensemble.enabled)
+  stage 05  ensemble + stack        <- writes reports/submissions/submission_ensemble.csv
+```
+
+With `ensemble.enabled: false` the order reverses its tail: stage 3 trains, stage 4
+scores and writes the submission, stage 5 returns None and writes nothing.
+
+### 6. `ensemble.device` was read by nothing
+
+The key is in config.yaml, documented on `EnsembleConfig`, and consumed by no code
+path. The only device read in `ensemble.py` was a *member's own* params, and no
+member in the config sets one. So a Kaggle run with `device: cuda` would have
+trained all nine members on CPU - 700k rows, ten folds, nine models.
+
+Every family also spells it differently, so it was not one line:
+
+| family | key it needs |
+|---|---|
+| xgboost | `device: cuda` |
+| lightgbm | `device: gpu` |
+| catboost | `task_type: GPU` |
+| realmlp, tabnet | `device` |
+
+`apply_device` now writes the right key per family from `ensemble.device`. On
+"cpu" params pass through untouched, so a member can still opt into the GPU
+itself. **The config value is still `cpu`, which is correct for a local run - flip
+it to `cuda` on Kaggle, where it now does something.**
+
+### 7. `routediff_Arrival Delay in Minutes` was NaN on 204 rows
+
+Stage 2 has never run to completion with the residual block. `Arrival Delay in
+Minutes` is absent on 204 training rows; the route mean is a groupby mean so it is
+defined there, and `NaN - mean` is NaN. `check_feature_list` refused:
+
+```
+ValueError: The configured features still contain 204 missing values:
+{'routediff_Arrival Delay in Minutes': 204}
+```
+
+This is the feature-contract guard earning its keep. The block shipped as code,
+was wired in, logged `added=36`, and had never once been scored - because until
+this week the 90 generated names were not in `config.features` either, so the
+checker was never asked about them.
+
+Fixed with `fillna(0.0)`: zero means "no deviation recorded", which is the honest
+reading of a missing observation. 0.04% of rows, so the choice is not measurable.
+Verified by removing the fill and watching the new test fail.
+
+Stage 2 now completes: `features=160 missing_values=0`, and all four artifacts
+(train / validation / test / competition_test) are NaN-free on the 160 features
+with no duplicate columns.
+
+### 8. Dead config: `arrival_delay_median_for_model`
+
+Read into `DataCleaningConfig.arrival_delay_median` and never applied anywhere.
+The raw delay is not a configured feature (only its twins, digits, freq and
+encodings are), so nothing is broken by it - but it is a setting that reads like
+it controls something and does not. Left in place, flagged here.
+
+### End-to-end check on the real artifacts
+
+Real stage-5 assembly and a real `write_submission`, with toy budgets:
+
+```
+stage 5 input: train=40000 + validation=40000 = 80000 rows, 189 cols
+member lgb oof_auc=0.952954 features=160
+member xgb oof_auc=0.954519 features=160
+member nn  oof_auc=0.723643 features=160
+chosen=rank nested_auc=0.954623
+wrote 299844 rows
+columns match template: True
+ids match template exactly: True
+probabilities: min=0.0012 max=0.9999 finite=True
+```
+
+Two guards fired correctly on the way, both on my smoke script rather than the
+pipeline: `write_submission` rejected a 40,000-row competition frame against a
+299,844-row template, and `check_feature_list` caught the routediff NaN.

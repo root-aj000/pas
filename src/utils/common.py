@@ -106,28 +106,61 @@ def describe_kaggle_input(limit: int = 30) -> str:
     return "\n".join(lines)
 
 
-def find_kaggle_file(filename: str) -> Path | None:
+def find_kaggle_file(
+    filename: str, preferred_root: str | Path | None = None
+) -> Path | None:
     """Look for a data file in the Kaggle input mounts, at any depth.
 
     Args:
         filename: Just the file name, for example "train.csv".
+        preferred_root: A directory to search first. When the file exists there
+            that match wins over anything else mounted.
 
     Returns:
-        The first match, or None if there is none.
+        The match, or None if there is none.
+
+    Raises:
+        FileNotFoundError: If the file is mounted in more than one place and no
+            preferred_root was given, because there is no way to tell which one
+            was meant and guessing wrong trains on the wrong data silently.
 
     Note:
     Recursive on purpose. A competition dataset may mount as
     `/kaggle/input/<slug>/train.csv`, as
     `/kaggle/input/<slug>/competitions/playground-series-s6e10/train.csv`, or
     with the files one level deeper still. A one-level glob misses the last two.
+
+    The ambiguity guard exists because two mounted datasets can both hold a
+    train.csv. Sorted order used to decide, which meant the answer changed if a
+    path changed - no error, just a different dataset and a different score.
     """
+    if preferred_root is not None:
+        direct = Path(preferred_root) / filename
+        if direct.is_file():
+            return direct
+
+    matches: list[Path] = []
     for mount in KAGGLE_INPUT_DIRS:
         if not mount.is_dir():
             continue
-        for candidate in sorted(mount.rglob(filename)):
-            if candidate.is_file():
-                return candidate
-    return None
+        matches.extend(
+            candidate
+            for candidate in sorted(mount.rglob(filename))
+            if candidate.is_file()
+        )
+    if not matches:
+        return None
+    if preferred_root is not None and len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        listed = "\n  ".join(str(m) for m in matches)
+        raise FileNotFoundError(
+            f"{filename} is mounted in {len(matches)} places and config.yaml does "
+            f"not say which to use:\n  {listed}\n"
+            "Set kaggle_dataset_path in config.yaml to the directory that holds "
+            "the files you want."
+        )
+    return matches[0]
 
 
 def setup_logging(name: str = LOGGER_NAME) -> logging.Logger:
@@ -147,6 +180,18 @@ def setup_logging(name: str = LOGGER_NAME) -> logging.Logger:
         stream=sys.stdout,
         force=True,
     )
+    # Lightning advertises its cloud logger on every Trainer it builds, once per
+    # member per fold, via `rank_zero_info`. The message reaches the console
+    # through `pytorch_lightning.utilities.rank_zero`'s logger - not the
+    # `lightning_utilities` one, and not the "lightning"/"pytorch_lightning"
+    # names either, because that module sets its own level when it is imported.
+    # Silencing the parent is undone by that. Nobody here logs to the cloud, so
+    # the tip is noise in the middle of a run log.
+    for noisy in (
+        "pytorch_lightning.utilities.rank_zero",
+        "lightning_utilities.core.rank_zero",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     return logging.getLogger(name)
 
 

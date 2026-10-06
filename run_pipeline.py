@@ -25,6 +25,7 @@ from src.pipeline.stage_01_data_ingestion import run_pipeline as run_stage_01
 from src.pipeline.stage_02_data_cleaning_encoding import run_pipeline as run_stage_02
 from src.pipeline.stage_03_model_training import run_pipeline as run_stage_03
 from src.pipeline.stage_04_model_evaluation import run_pipeline as run_stage_04
+from src.pipeline.stage_05_ensemble import run_pipeline as run_stage_05
 from src.utils.common import (
     build_run_log_name,
     ensure_project_root,
@@ -119,15 +120,38 @@ def main() -> int:
         log_step("run", stage="02_data_cleaning_encoding")
         run_stage_02()
 
-        model_version = next_model_version(reader.create_pipeline_config().models_root)
-        log_step("run", stage="03_model_training", model_version=model_version)
-        model_version = run_stage_03(model_version=model_version)
-        facts["model_version"] = f"model_{model_version}"
+        # The ensemble and the single-model path are alternatives, not a sequence.
+        # Running both would train every model twice and write two submissions,
+        # and the reader would not know which one was meant to be the answer.
+        # So when the ensemble is on, stages 3 and 4 are skipped entirely.
+        if reader.create_ensemble_config().enabled:
+            log_step(
+                "run",
+                stage="03_model_training",
+                skipped=True,
+                reason="ensemble.enabled is true",
+            )
+            log_step(
+                "run",
+                stage="04_model_evaluation",
+                skipped=True,
+                reason="ensemble.enabled is true",
+            )
+            log_step("run", stage="05_ensemble")
+            ensemble_submission = run_stage_05()
+            if ensemble_submission is not None:
+                facts["submission"] = Path(ensemble_submission).name
+        else:
+            model_version = next_model_version(
+                reader.create_pipeline_config().models_root
+            )
+            log_step("run", stage="03_model_training", model_version=model_version)
+            model_version = run_stage_03(model_version=model_version)
+            facts["model_version"] = f"model_{model_version}"
 
-        log_step("run", stage="04_model_evaluation")
-        evaluation_artifact = run_stage_04(model_version=model_version)
-
-        facts["submission"] = evaluation_artifact.submission_path.name
+            log_step("run", stage="04_model_evaluation")
+            evaluation_artifact = run_stage_04(model_version=model_version)
+            facts["submission"] = evaluation_artifact.submission_path.name
     # Catching everything is deliberate, not lazy. This is the entry point: a
     # failure here must be written into the run log with its exit code, not die
     # with a traceback and no record. The error is logged in full below, so it is

@@ -137,9 +137,112 @@ def route_feature_names(numeric_columns: list[str]) -> list[str]:
     This is the single source of truth for generated names. The builder and the
     checker both read it, so they cannot disagree about what exists.
     """
-    return ["route_size", "route_target_encoded"] + [
-        f"route_mean_{column}" for column in numeric_columns
-    ]
+    return (
+        ["route_size", "route_target_encoded"]
+        + [f"route_mean_{column}" for column in numeric_columns]
+        + [f"routediff_{column}" for column in numeric_columns]
+    )
+
+
+DIGIT_COLUMNS: list[str] = [
+    "Age",
+    "Flight Distance",
+    "Departure Delay in Minutes",
+    "Arrival Delay in Minutes",
+]
+
+
+def digit_feature_names(columns: list[str] | None = None) -> list[str]:
+    """Return the deterministic names of the digit features.
+
+    Args:
+        columns: Which numeric columns to decompose. Defaults to the four that
+            carry a magnitude.
+
+    Returns:
+        One `<column>_d-4` .. `<column>_d3` per column, eight each.
+
+    Note:
+    (v // 10**k) % 10, for k from -4 to 3. A synthetic generator often writes
+    values with structure in their digits that a model reading the number as a
+    single quantity cannot see - and the raw value is one column while its digits
+    are eight. Reference measured +0.000211 for this block on its own.
+    """
+    used = DIGIT_COLUMNS if columns is None else columns
+    return [f"{column}_d{k}" for column in used for k in range(-4, 4)]
+
+
+def add_digit_features(
+    frame: pd.DataFrame, columns: list[str] | None = None
+) -> pd.DataFrame:
+    """Split each numeric column into its decimal digits, one column per place.
+
+    Args:
+        frame: Rows to enrich. Not modified.
+        columns: Which numeric columns to decompose.
+
+    Returns:
+        A new frame with eight int8 columns per input column.
+
+    Note:
+    Deterministic arithmetic: no fitting, no label, nothing to leak. For
+    k >= 0 this is the k-th digit from the right; for k < 0, the k-th from the
+    left of the fractional part. Negative powers are exact in float64, so the
+    fractional digits are not rounded away.
+    """
+    enriched = frame.copy()
+    for column in DIGIT_COLUMNS if columns is None else columns:
+        value = pd.to_numeric(enriched[column], errors="coerce").fillna(0.0)
+        for k in range(-4, 4):
+            enriched[f"{column}_d{k}"] = (value // (10.0**k) % 10).astype("int8")
+    return enriched
+
+
+def frequency_feature_names(columns: list[str]) -> list[str]:
+    """Return the deterministic names of the frequency features.
+
+    Args:
+        columns: Which columns get a frequency and a rarity.
+
+    Returns:
+        One `freq_<column>` and one `rarity_<column>` per column.
+    """
+    names: list[str] = []
+    for column in columns:
+        names.append(f"freq_{column}")
+        names.append(f"rarity_{column}")
+    return names
+
+
+def add_frequency_features(
+    frame: pd.DataFrame, columns: list[str], counts: dict[str, pd.Series]
+) -> pd.DataFrame:
+    """Add how common, and how rare, each value is.
+
+    Args:
+        frame: Rows to enrich. Not modified.
+        columns: Which columns get a frequency and a rarity.
+        counts: Column name to its value_counts, fitted on the train split.
+
+    Returns:
+        A new frame with two float32 columns per input column.
+
+    Note:
+    A rate column that most rows have never seen is telling you something the
+    rate itself cannot. Rarity is -log(frequency), so a value seen once sits far
+    from a value seen ten thousand times, where a plain frequency would squash
+    both near zero. Reference measured +0.000128 for the block. Label-free: the
+    counts come from the train split's own column.
+    """
+    enriched = frame.copy()
+    total = max(len(frame), 1)
+    for column in columns:
+        share = frame[column].map(counts[column]).fillna(0.0) / total
+        enriched[f"freq_{column}"] = share.astype("float32")
+        enriched[f"rarity_{column}"] = (-np.log(share.clip(lower=1.0 / total))).astype(
+            "float32"
+        )
+    return enriched
 
 
 def count_feature_names(numeric_columns: list[str]) -> list[str]:
@@ -266,6 +369,22 @@ def apply_route_features(
     for column in numeric_columns:
         profile_column = f"route_mean_{column}"
         joined[profile_column] = joined[profile_column].fillna(global_means[column])
+        # The residual: how unusual this passenger is for the route they flew.
+        # The route mean says what a typical passenger on this route answers; the
+        # residual says this one differs. Reference measured +0.000128 for the
+        # profile block and this is the part of it we were missing.
+        #
+        # `fillna(0.0)` is load-bearing, not tidiness: `Arrival Delay in Minutes`
+        # is absent on 204 training rows, and the route mean is a groupby mean so
+        # it is still defined there - the subtraction was NaN and took the run
+        # down at `check_feature_list`. Zero means "no deviation recorded", which
+        # is the honest reading of a missing observation: the model is not told
+        # the row is average for its route, it is told nothing about it. 0.04% of
+        # rows, so the choice between this and any other neutral value is not
+        # measurable; what matters is that it is not NaN.
+        joined[f"routediff_{column}"] = (
+            joined[column] - joined[profile_column]
+        ).fillna(0.0).astype("float32")
 
     if use_oof_target is not None:
         # Train rows take their out-of-fold values. No row ever sees its own label.
@@ -619,6 +738,29 @@ def add_route_features_to_all(
         name: add_value_counts(frame, counts) for name, frame in enriched_frames.items()
     }
     log_step("value_counts", columns=len(count_columns))
+
+    # Digits, then frequency and rarity of every raw column. Both are arithmetic
+    # on columns already present, fitted on the train split's own values, so no
+    # label is involved and nothing can leak.
+    enriched_frames = {
+        name: add_digit_features(frame) for name, frame in enriched_frames.items()
+    }
+    log_step("digit_features", columns=len(digit_feature_names()))
+
+    frequency_columns = [
+        c for c in CANDIDATE_FEATURE_COLUMNS if c in enriched_frames["train"].columns
+    ]
+    frequency_counts = {
+        c: enriched_frames["train"][c].astype(str).value_counts()
+        for c in frequency_columns
+    }
+    enriched_frames = {
+        name: add_frequency_features(frame, frequency_columns, frequency_counts)
+        for name, frame in enriched_frames.items()
+    }
+    log_step(
+        "frequency_features", columns=len(frequency_feature_names(frequency_columns))
+    )
 
     train_frame = enriched_frames["train"]
     route_table, global_means, global_rate = build_route_table(
