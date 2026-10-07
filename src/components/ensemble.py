@@ -298,7 +298,7 @@ def fit_member_to_artifacts(
     config: EnsembleConfig,
     target_column: str,
     artifacts_dir: Path,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float]:
     """Cross-validate one member and save its predictions.
 
     Args:
@@ -382,6 +382,17 @@ def apply_device(kind: str, params: dict[str, Any], device: str) -> dict[str, An
     out = dict(params)
     if device != "cuda":
         return out
+    # Every member in config.yaml asks for n_jobs=8. On a laptop that is right.
+    # On a 2x T4 Kaggle session there are four cores for *both* workers, so two
+    # workers each grabbing eight threads is 16 threads on four cores - the
+    # oversubscription shows up as a maxed-out CPU next to a mostly idle GPU,
+    # because every histogram build and frame conversion is waiting on a thread
+    # that is queued behind seven others. Split the cores instead of doubling
+    # them up. This is the ceiling of a naive split, not a scheduler: if the
+    # member counts per shard are unbalanced this still oversubscribes.
+    workers = max(int(os.environ.get("PAS_SHARD_COUNT", "1")), 1)
+    if workers > 1 and int(out.get("n_jobs", 0)) > 1:
+        out["n_jobs"] = max(int(out["n_jobs"]) // workers, 1)
     if kind == "xgboost":
         out["device"] = "cuda"
     elif kind == "lightgbm":
@@ -941,11 +952,15 @@ def run_gpu_shards(
     if log_dir is None:
         log_dir = artifacts_dir / "shard_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    started: list[tuple[int, str, Any, Any, Path]] = []
     for index, group in enumerate(groups):
         names = ",".join(group)
         log_path = log_dir / f"gpu{index}.log"
         environment = dict(os.environ)
         environment["CUDA_VISIBLE_DEVICES"] = str(index)
+        # So `apply_device` splits `n_jobs` between the workers instead of letting
+        # each one claim every core.
+        environment["PAS_SHARD_COUNT"] = str(len(groups))
         command = [
             sys.executable,
             "-m",
@@ -955,21 +970,32 @@ def run_gpu_shards(
             "--artifacts",
             str(artifacts_dir),
         ]
-        with log_path.open("w", encoding="utf-8") as handle:
-            completed = subprocess.run(
-                command,
-                env=environment,
-                stdout=handle,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"the worker for GPU {index} failed with exit code "
-                f"{completed.returncode} while training {names}. Its log is "
-                f"{log_path}."
-            )
+        # Started, not waited on. `subprocess.run` blocks, and blocking here made
+        # the workers strictly sequential: GPU 0 trained every one of its members
+        # while GPU 1 sat at 0% until the first worker exited, so a two-GPU
+        # session delivered one GPU's throughput and looked like the second card
+        # was broken.
+        handle = log_path.open("w", encoding="utf-8")
+        process = subprocess.Popen(
+            command, env=environment, stdout=handle, stderr=subprocess.STDOUT
+        )
+        started.append((index, names, process, handle, log_path))
         log_step("gpu_shard", gpu=index, members=len(group), log=str(log_path))
+
+    failures: list[str] = []
+    for index, names, process, handle, log_path in started:
+        return_code = process.wait()
+        handle.close()
+        if return_code != 0:
+            failures.append(
+                f"GPU {index} (members {names}) exited {return_code}; log {log_path}"
+            )
+    if failures:
+        raise RuntimeError(
+            "ensemble workers failed: " + "; ".join(failures) + ". The surviving "
+            "workers' .npy files are on disk, but they must not be stacked against "
+            "a member that is missing."
+        )
 
 
 def train_ensemble(
@@ -1033,6 +1059,12 @@ def train_ensemble(
             gpus=len(groups),
             members=len(config.members),
         )
+        # The parent does no training on this path - every worker builds and holds
+        # its own copy of the frames - so the parent's copy is dead weight. At
+        # 699,635 rows by 160 columns that is ~2 GB per process competing with
+        # the workers for the same RAM and cores. Only the label survives, and it
+        # is needed below to score the .npy files the workers wrote.
+        del train_frame, competition_frame
         run_gpu_shards(groups, artifacts_dir)
         for spec in config.members:
             oof = np.load(artifacts_dir / f"oof_{spec.name}.npy")

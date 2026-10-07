@@ -411,37 +411,6 @@ def test_target_encodings_off_keeps_the_block_out_of_the_member(monkeypatch) -> 
     )
 
 
-def test_stage_five_trains_on_train_plus_validation() -> None:
-    """Structural guard: stage 5 must not silently drop the validation split.
-
-    Stage 2 splits 70/15/15 for the single-model path, where the validation file
-    gave stages 3 and 4 something to select on. Stage 5 cross-validates internally
-    and needs no held-out split, so reading only `train.csv` discarded 209,892
-    rows - 30% of the labelled data - from every member.
-
-    This checks the source rather than the behaviour, which is normally the wrong
-    way round. It is here because the failure mode is a *number*, not an
-    exception: the run completes, writes a plausible submission and reports a
-    normal nested score, 0.001 low, with nothing anywhere reporting an error.
-    Running stage 5 for real needs a full artifacts tree and a fitted config,
-    which is not a unit test. The row count the run logs (`rows=`, emitted
-    alongside `train_rows=` and `validation_rows=`) is the thing to watch in the
-    actual output.
-    """
-    import inspect
-
-    from src.pipeline import stage_05_ensemble
-
-    source = inspect.getsource(stage_05_ensemble.run_pipeline)
-    assert "validation.csv" in source, (
-        "stage 5 no longer reads validation.csv, so it trains on 70% of the rows"
-    )
-    assert "pd.concat" in source, (
-        "stage 5 must fold the validation rows into training, not read them "
-        "alongside and ignore them"
-    )
-
-
 def test_ensemble_device_reaches_every_family() -> None:
     """`ensemble.device: cuda` has to reach each family under its own key.
 
@@ -561,7 +530,6 @@ def test_load_ensemble_frames_uses_every_labelled_split(tmp_path) -> None:
     """
     import json
 
-    import src.utils.common as common
     from src.components.ensemble import load_ensemble_frames
 
     def write(name: str, rows: int, label: bool) -> None:
@@ -583,3 +551,52 @@ def test_load_ensemble_frames_uses_every_labelled_split(tmp_path) -> None:
     assert len(competition_frame) == 30
     assert "satisfaction" in train_frame.columns
     assert "satisfaction" not in competition_frame.columns
+
+
+def test_gpu_shards_start_before_any_of_them_is_waited_on() -> None:
+    """The workers must run concurrently, not one after the other.
+
+    `subprocess.run` blocks, and blocking inside the loop over shards made the
+    workers strictly sequential: GPU 0 trained every member in its group while
+    GPU 1 sat at 0% until the first process exited. A two-GPU session delivered
+    one GPU's throughput and the second card looked broken.
+
+    The check is on the call itself - `Popen` for all groups, `wait` only after -
+    because a timing assertion on a test machine with no GPU would pass for the
+    wrong reason.
+    """
+    import inspect
+
+    from src.components.ensemble import run_gpu_shards
+
+    source = inspect.getsource(run_gpu_shards)
+    start = source.index("for index, group in enumerate(groups)")
+    middle = source.index("failures: list[str] = []")
+    launching, waiting = source[start:middle], source[middle:]
+    assert "Popen(" in launching, "workers must be started with Popen, not run()"
+    assert "subprocess.run(" not in launching, (
+        "subprocess.run blocks, so the shards are sequential"
+    )
+    assert ".wait()" in waiting and "Popen(" not in waiting, (
+        "every worker must be launched before any is waited on"
+    )
+
+
+def test_njobs_is_split_between_shards(monkeypatch) -> None:
+    """Two workers on four cores must not each claim eight threads.
+
+    Every member in config.yaml sets n_jobs=8, which is right on a laptop and is
+    16 threads on 4 cores once a second worker is running. The symptom is a
+    maxed-out CPU beside an idle GPU, because the frame conversion and histogram
+    builds are all queued behind each other.
+    """
+    from src.components.ensemble import apply_device
+
+    monkeypatch.setenv("PAS_SHARD_COUNT", "2")
+    assert apply_device("lightgbm", {"n_jobs": 8}, "cuda")["n_jobs"] == 4
+    assert apply_device("xgboost", {"n_jobs": 8}, "cuda")["n_jobs"] == 4
+    # One worker keeps everything, and a single-threaded request is not inflated.
+    monkeypatch.setenv("PAS_SHARD_COUNT", "1")
+    assert apply_device("lightgbm", {"n_jobs": 8}, "cuda")["n_jobs"] == 8
+    monkeypatch.setenv("PAS_SHARD_COUNT", "2")
+    assert apply_device("lightgbm", {"n_jobs": 1}, "cuda")["n_jobs"] == 1
