@@ -117,13 +117,24 @@ def test_save_dataframe_creates_missing_folders(tmp_path) -> None:
     assert len(pd.read_csv(path)) == 2
 
 
-def test_stage_03_runs_the_overfitting_check_before_training() -> None:
+def test_stage_03_runs_the_overfitting_check_before_training(monkeypatch) -> None:
     """Stage 3 must refuse to train a model that cannot learn.
 
     This is the wiring test: it proves the check is actually called by the stage,
     not just present in the component.
     """
-    assert run_overfitting_check("hist_gradient_boosting", {}, seed=42) is True
+    from src.pipeline import stage_03_model_training
+
+    called = []
+    original = stage_03_model_training.run_overfitting_check
+
+    def spy(*args, **kwargs):
+        called.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(stage_03_model_training, "run_overfitting_check", spy)
+    stage_03_model_training.run_pipeline()
+    assert called, "run_overfitting_check was not called by stage_03"
 
 
 def test_every_stage_module_exposes_run_pipeline() -> None:

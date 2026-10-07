@@ -388,11 +388,10 @@ def fit_one(estimator, X: pd.DataFrame, y: pd.Series, categorical: list[str]):
     try:
         estimator.fit(X, y, cat_col_names=categorical)
     except TypeError:
-        pass
-    try:
-        estimator.fit(X, y, categorical_feature=categorical)
-    except TypeError:
-        estimator.fit(X, y)
+        try:
+            estimator.fit(X, y, categorical_feature=categorical)
+        except TypeError:
+            estimator.fit(X, y)
     return estimator
 
 

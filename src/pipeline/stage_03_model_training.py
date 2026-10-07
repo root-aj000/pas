@@ -50,7 +50,7 @@ def run_pipeline(model_version: int | None = None) -> int:
 
     log_step(
         STAGE_NAME,
-        rows_out=artifact.validation_metrics.get("accuracy"),
+        accuracy=artifact.validation_metrics.get("accuracy"),
         model_version=artifact.model_version,
         roc_auc=round(artifact.validation_metrics.get("roc_auc", 0.0), 6),
         fit_seconds=round(artifact.training_seconds, 1),

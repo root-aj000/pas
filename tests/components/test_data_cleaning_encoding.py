@@ -257,23 +257,6 @@ def test_raises_for_an_unknown_encoding(tmp_path) -> None:
         encode_categorical_columns(frame, config, categories)
 
 
-def _route_config(tmp_path, **overrides):
-    """Return settings with route features switched on.
-
-    Args:
-        tmp_path: pytest's temporary folder.
-        **overrides: Any setting to change.
-    """
-    base = make_config(tmp_path, **overrides)
-    from dataclasses import replace
-
-    return replace(
-        base,
-        route_features_enabled=True,
-        route_smoothing=20.0,
-        aux_features_enabled=False,
-    )
-
 
 def make_routable_frame(rows: int = 200) -> "pd.DataFrame":
     """Return rows sharing a handful of Flight Distance values.
@@ -476,7 +459,6 @@ def _aux_frame(rows: int = 900, seed: int = 0) -> pd.DataFrame:
         frame[SERVICE_RATING_COLUMNS].mean(axis=1) > rng.uniform(2.5, 3.5)
     ).astype(int)
     assert list(frame.columns) == CANDIDATE_FEATURE_COLUMNS + ["satisfaction"]
-    assert CATEGORICAL_COLUMNS
     return frame
 
 

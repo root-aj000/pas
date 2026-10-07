@@ -85,6 +85,7 @@ def read_errors(
     target: pd.Series,
     probabilities: NDArray[np.float64],
     limit: int = 20,
+    decision_threshold: float = 0.5,
 ) -> pd.DataFrame:
     """Return the rows the model got wrong, worst-confidence first.
 
@@ -108,7 +109,7 @@ def read_errors(
             "predicted_probability": probabilities,
         }
     )
-    scored["was_wrong"] = (scored["predicted_probability"] >= 0.5) != scored[
+    scored["was_wrong"] = (scored["predicted_probability"] >= decision_threshold) != scored[
         "actual_satisfied"
     ]
     wrong = scored[scored["was_wrong"]].copy()
@@ -338,7 +339,7 @@ def run_model_evaluation(config: ModelEvaluationConfig) -> ModelEvaluationArtifa
 
     errors = read_errors(test_data, test_data[config.target_column], test_probabilities)
     logger.info("[errors] %d wrong rows, worst-confidence first", len(errors))
-    print(errors.head(10).to_string(index=False))
+    logger.info("\n%s", errors.head(10).to_string(index=False))
 
     competition_frame = apply_categorical_encoding(
         pd.read_csv(config.competition_test_path),

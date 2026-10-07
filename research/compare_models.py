@@ -242,7 +242,7 @@ def main() -> int:
     logger.info("wrote %s", output)
 
     best = table.iloc[0]
-    bar = BASELINES[1][1]
+    bar = BASELINES[1][2]
     logger.info("")
     logger.info("Best candidate: %s at roc_auc %.6f", best["model"], best["roc_auc"])
     logger.info("One-column rule to beat: %.4f", bar)

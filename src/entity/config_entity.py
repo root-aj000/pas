@@ -8,7 +8,7 @@ letting stage 3 fail with a confusing error three steps later.
 See .lead/02-A-ARCHITECTURE.md section 2.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -161,4 +161,4 @@ class PipelineConfig:
     models_root: Path
     report_root: Path
     artifacts_root: Path
-    unknown_settings: list[str] = field(default_factory=list)
+

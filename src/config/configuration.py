@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-from src.components.ensemble import EnsembleConfig, MemberSpec
+from src.components.ensemble import EnsembleConfig, MemberSpec, resolve_device
 from src.constants import (
     CANDIDATE_FEATURE_COLUMNS,
     CATEGORICAL_COLUMNS,
@@ -384,10 +384,13 @@ class PipelineConfigReader:
             members=members,
             folds=int(block.get("folds", 10)),
             seed=int(block.get("seed", 42)),
-            device=str(block.get("device", "cpu")),
+            device=resolve_device(str(require_key(self.config, "device"))),
             stack_C=float(block.get("stack_C", 1.0)),
             te_columns=[str(c) for c in (block.get("te_columns") or [])],
             combiner=str(block.get("combiner", "logistic")),
+            pseudo_label_enabled=bool(block.get("pseudo_label_enabled", False)),
+            pseudo_label_high=float(block.get("pseudo_label_high", 0.95)),
+            pseudo_label_low=float(block.get("pseudo_label_low", 0.05)),
         )
 
     def create_pipeline_config(self, model_version: int = 1) -> PipelineConfig:

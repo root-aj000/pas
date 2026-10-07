@@ -64,19 +64,97 @@ def add_derived_features(
     enriched = frame.copy()
     ratings = config.service_rating_columns
 
+    # 0 is a missing code in rating columns, not a real rating. Replace with NaN
+    # before computing aggregations so mean/min/count are not polluted.
+    rating_frame = enriched[ratings].replace(0, np.nan)
+
     for name in config.derived_feature_names:
         if name == "mean_service_rating":
-            enriched[name] = enriched[ratings].mean(axis=1)
+            enriched[name] = rating_frame.mean(axis=1)
         elif name == "worst_service_rating":
-            enriched[name] = enriched[ratings].min(axis=1)
+            enriched[name] = rating_frame.min(axis=1)
         elif name == "count_of_ratings_at_or_below_2":
-            enriched[name] = (enriched[ratings] <= 2).sum(axis=1)
+            enriched[name] = (rating_frame <= 2).sum(axis=1)
+        elif name == "count_of_5s":
+            enriched[name] = (rating_frame == 5).sum(axis=1)
+        elif name == "count_of_1s":
+            enriched[name] = (rating_frame == 1).sum(axis=1)
+        elif name == "rating_std":
+            enriched[name] = rating_frame.std(axis=1)
+        elif name == "online_boarding_x_class":
+            enriched[name] = (
+                enriched["Online boarding"].astype(str) + "_" + enriched["Class"].astype(str)
+            )
+        elif name == "online_boarding_x_travel_type":
+            enriched[name] = (
+                enriched["Online boarding"].astype(str) + "_" + enriched["Type of Travel"].astype(str)
+            )
+        elif name == "class_x_customer_type":
+            enriched[name] = (
+                enriched["Class"].astype(str) + "_" + enriched["Customer Type"].astype(str)
+            )
+        elif name == "age_bin":
+            enriched[name] = pd.cut(
+                enriched["Age"],
+                bins=[0, 18, 25, 35, 45, 55, 65, 100],
+                labels=["0-18", "18-25", "25-35", "35-45", "45-55", "55-65", "65+"],
+            ).astype(str)
+        elif name == "distance_bin":
+            enriched[name] = pd.cut(
+                enriched["Flight Distance"],
+                bins=[0, 500, 1000, 1500, 2000, 3000, 5000],
+                labels=["0-500", "500-1000", "1000-1500", "1500-2000", "2000-3000", "3000+"],
+            ).astype(str)
+        elif name == "any_delay":
+            enriched[name] = (
+                (enriched["Departure Delay in Minutes"] > 0)
+                | (enriched["Arrival Delay in Minutes"].fillna(0) > 0)
+            ).astype(int)
+        elif name == "dep_delayed":
+            enriched[name] = (enriched["Departure Delay in Minutes"] > 0).astype(int)
+        elif name == "arr_delayed":
+            enriched[name] = (enriched["Arrival Delay in Minutes"].fillna(0) > 0).astype(int)
+        elif name == "delay_over_15min":
+            enriched[name] = (
+                (enriched["Departure Delay in Minutes"] > 15)
+                | (enriched["Arrival Delay in Minutes"].fillna(0) > 15)
+            ).astype(int)
+        elif name == "age_squared":
+            enriched[name] = enriched["Age"] ** 2
+        elif name == "distance_squared":
+            enriched[name] = enriched["Flight Distance"] ** 2
+        elif name == "age_over_distance":
+            enriched[name] = enriched["Age"] / (enriched["Flight Distance"] + 1)
+        elif name == "delay_over_distance":
+            enriched[name] = (
+                enriched["Departure Delay in Minutes"] + enriched["Arrival Delay in Minutes"].fillna(0)
+            ) / (enriched["Flight Distance"] + 1)
+        elif name == "online_boarding_x_class_int":
+            enriched[name] = (
+                enriched["Online boarding"].astype(int) * 10
+                + enriched["Class"].map({"Business": 0, "Eco": 1, "Eco Plus": 2}).fillna(0).astype(int)
+            )
+        elif name == "online_boarding_x_travel_type_int":
+            enriched[name] = (
+                enriched["Online boarding"].astype(int) * 10
+                + enriched["Type of Travel"].map({"Business travel": 0, "Personal Travel": 1}).fillna(0).astype(int)
+            )
+        elif name == "class_x_customer_type_int":
+            enriched[name] = (
+                enriched["Class"].map({"Business": 0, "Eco": 1, "Eco Plus": 2}).fillna(0).astype(int) * 10
+                + enriched["Customer Type"].map({"Loyal Customer": 0, "disloyal Customer": 1}).fillna(0).astype(int)
+            )
         else:
             raise ValueError(
                 f"No calculation is defined for derived feature '{name}'. "
                 f"Known names: mean_service_rating, worst_service_rating, "
-                "count_of_ratings_at_or_below_2. Add the calculation here and the "
-                "description in config.yaml."
+                "count_of_ratings_at_or_below_2, count_of_5s, count_of_1s, rating_std, "
+                "online_boarding_x_class, online_boarding_x_travel_type, "
+                "class_x_customer_type, age_bin, distance_bin, any_delay, dep_delayed, "
+                "arr_delayed, delay_over_15min, age_squared, distance_squared, "
+                "age_over_distance, delay_over_distance, online_boarding_x_class_int, "
+                "online_boarding_x_travel_type_int, class_x_customer_type_int. "
+                "Add the calculation here and the description in config.yaml."
             )
     log_step(
         "derive",
@@ -85,6 +163,43 @@ def add_derived_features(
         added=[name for name in config.derived_feature_names],
     )
     return enriched
+
+
+def add_outlier_flags(frame: pd.DataFrame, bounds: dict[str, tuple[float, float]]) -> pd.DataFrame:
+    """Flag rows outside train-fitted 1st/99th percentile bounds.
+
+    Args:
+        frame: Rows to flag. Not modified.
+        bounds: Column name to the (low, high) cutoffs, fitted on train only.
+
+    Returns:
+        A new frame with one `<column>_is_outlier` int column per bounded column.
+
+    Note:
+    The bounds come from train and are passed in, not recomputed per frame. A
+    99th percentile computed separately on each split makes the same value a
+    different feature on train than on competition - training-serving skew that is
+    silent, because every frame is internally consistent.
+    """
+    enriched = frame.copy()
+    for column, (low, high) in bounds.items():
+        enriched[f"{column}_is_outlier"] = (
+            (enriched[column] < low) | (enriched[column] > high)
+        ).astype(int)
+    return enriched
+
+
+def outlier_bounds(
+    train_frame: pd.DataFrame, columns: list[str]
+) -> dict[str, tuple[float, float]]:
+    """Return the 1st/99th percentile bounds for each column, from train only."""
+    return {
+        column: (
+            float(train_frame[column].quantile(0.01)),
+            float(train_frame[column].quantile(0.99)),
+        )
+        for column in columns
+    }
 
 
 def add_arrival_delay_status(
@@ -510,6 +625,8 @@ def split_the_data(
     """
     check_columns("split", set(frame.columns), {config.target_column})
     remaining = 1 - config.test_size
+    if remaining <= 0:
+        raise ValueError(f"test_size={config.test_size} leaves no rows for train/validation")
     validation_share_of_remaining = config.validation_size / remaining
 
     holdout_and_train, test_frame = train_test_split(
@@ -913,8 +1030,6 @@ def apply_auxiliary_features(
     Returns:
         A new frame with the 30 auxiliary-task columns.
     """
-    import numpy as np
-
     order = aux_feature_names(rating_columns)
     if precomputed is not None:
         return pd.concat(
@@ -1004,7 +1119,7 @@ def add_oof_auxiliary_predictions(
         )
         own_column = np.zeros(len(train_frame), dtype=np.float32)
         for fitting_index, scoring_index in KFold(
-            folds, shuffle=True, random_state=0
+            folds, shuffle=True, random_state=seed
         ).split(coded):
             from xgboost import XGBClassifier
 
@@ -1189,7 +1304,7 @@ def encode_categorical_columns(
     if config.categorical_encoding == "one_hot":
         encoded = pd.concat(
             [
-                pd.get_dummies(frame[column], columns=[column], dtype=int).reindex(
+                pd.get_dummies(frame[column], prefix=column, dtype=int).reindex(
                     columns=[f"{column}_{value}" for value in values], fill_value=0
                 )
                 for column, values in all_categories.items()
@@ -1266,6 +1381,13 @@ def build_everything(
         enriched = add_derived_features(frame, config)
         enriched = add_arrival_delay_status(enriched, config)
         enriched_frames[name] = optionally_clip_outliers(enriched, config)
+
+    # Bounds fitted once on train, applied to all four frames, so a given value is
+    # the same feature everywhere. See add_outlier_flags.
+    bounds = outlier_bounds(train_frame, ["Age", "Flight Distance"])
+    enriched_frames = {
+        name: add_outlier_flags(frame, bounds) for name, frame in enriched_frames.items()
+    }
 
     if config.route_features_enabled:
         enriched_frames = add_route_features_to_all(enriched_frames, config)

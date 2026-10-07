@@ -75,8 +75,12 @@ def load_features(
     config = yaml.safe_load(Path("config.yaml").read_text())
     features: list[str] = list(config["features"])
     if quick:
-        train = train.sample(n=30000, random_state=SEED)
-        validation = validation.sample(n=10000, random_state=SEED)
+        train = train.groupby(TARGET, group_keys=False).apply(
+            lambda g: g.sample(n=min(30000, len(g)), random_state=SEED)
+        )
+        validation = validation.groupby(TARGET, group_keys=False).apply(
+            lambda g: g.sample(n=min(10000, len(g)), random_state=SEED)
+        )
     return (
         train[features].to_numpy(),
         train[TARGET].to_numpy(),

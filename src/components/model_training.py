@@ -173,7 +173,7 @@ MODEL_REGISTRY: dict[str, Callable[..., "Estimator"]] = {
 # Models that have no random_state parameter. Passing one would raise TypeError,
 # and per .dev/RULES.md rule 8 the run must stop with a clear message rather than
 # fail obscurely.
-MODELS_WITHOUT_RANDOM_STATE: frozenset[str] = frozenset({"decision_tree"})
+MODELS_WITHOUT_RANDOM_STATE: frozenset[str] = frozenset()
 
 # Overrides the overfitting check applies so it can do its job.
 #

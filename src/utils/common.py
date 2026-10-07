@@ -48,7 +48,7 @@ def find_project_root(marker: str = "config.yaml") -> Path:
     candidates = [
         Path.cwd(),
         *Path.cwd().parents,
-        Path(__file__).resolve(),
+        Path(__file__).resolve().parent,
         *Path(__file__).resolve().parents,
     ]
     for directory in dict.fromkeys(candidates):

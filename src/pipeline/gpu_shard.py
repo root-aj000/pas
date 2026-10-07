@@ -62,6 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging()
     logger = get_logger()
     wanted = [name.strip() for name in args.members.split(",") if name.strip()]
+    if not wanted:
+        logger.error("no members requested")
+        return 1
 
     reader = PipelineConfigReader()
     config = reader.create_ensemble_config()

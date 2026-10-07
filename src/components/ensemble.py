@@ -54,7 +54,7 @@ from src.utils.common import log_step, save_json
 # it invalidates comparison with docs/experiment_log.md, so it is a constant rather
 # than a per-run setting.
 SPLIT_SEED = 42
-STACK_SEED = 7
+STACK_SEED = 42
 LOGIT_FLOOR = 1e-6
 
 
@@ -102,16 +102,31 @@ class EnsembleConfig:
             the block.
         combiner: "logistic" for logistic regression on member logits, "rank" for
             rank-averaging with fitted weights.
+        pseudo_label_enabled: Whether to add confident competition predictions as
+            pseudo-labelled training rows and retrain. Skipped on the sharded path,
+            which no longer holds the frames.
+        pseudo_label_high: Upper confidence threshold for pseudo-labeling.
+        pseudo_label_low: Lower confidence threshold for pseudo-labeling.
     """
 
     enabled: bool = False
     members: list[MemberSpec] = field(default_factory=list)
     folds: int = 10
     seed: int = 42
-    device: str = "cpu"
     stack_C: float = 1.0
     te_columns: list[str] = field(default_factory=list)
     combiner: str = "logistic"
+    pseudo_label_enabled: bool = False
+    pseudo_label_high: float = 0.95
+    pseudo_label_low: float = 0.05
+    device: str = ""
+    """config.yaml's `device` key, passed through unchanged.
+
+    An empty default rather than "cpu" or "cuda" on purpose. A real value as the
+    default would be a second, silent source: a config missing the key would
+    quietly train on one device and report success. Empty fails
+    `resolve_device`'s check instead, naming config.yaml as the thing to fix.
+    """
 
 
 def select_features(all_features: list[str], spec: MemberSpec) -> list[str]:
@@ -142,30 +157,45 @@ def select_features(all_features: list[str], spec: MemberSpec) -> list[str]:
 
 
 def resolve_device(requested: str) -> str:
-    """Resolve `ensemble.device` to something an estimator will accept.
+    """Return the device to actually train on, given config.yaml's request.
 
     Args:
-        requested: "auto", "cpu" or "cuda".
+        requested: "cpu" or "cuda", straight from config.yaml's `device` key.
 
     Returns:
-        "cuda" when a GPU is visible and either "auto" or "cuda" was asked for,
-        otherwise "cpu".
+        "cuda" if config asked for cuda and a GPU is visible, otherwise "cpu".
+
+    Raises:
+        ValueError: If `requested` is neither "cpu" nor "cuda".
 
     Note:
-    "auto" exists because the alternative is a config that is wrong on one of the
-    two machines it has to be right on. The same file is committed for a laptop
-    with no GPU and a Kaggle session with two, so a fixed "cpu" trains nine
-    members over 700k rows on the processor and a fixed "cuda" crashes locally.
-    Neither failure says which line of config to change.
-    """
-    if requested == "auto":
-        try:
-            import torch
+    `device: cuda` in config means "use the GPU if this machine has one", not a
+    promise that it does. Kaggle sessions have two T4s and a laptop has none, and
+    one committed config has to be right on both - so cuda falls back to cpu when
+    no GPU is visible, which is what lets the same file run unmodified in both
+    places instead of failing halfway through a fit.
 
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:  # noqa: BLE001 - no torch is a cpu-only machine
-            return "cpu"
-    return requested
+    The fallback only ever downgrades, never upgrades. `device: cpu` stays cpu on
+    a machine that has a GPU, because the setting exists to be obeyed and the only
+    question this answers is whether obeying it is possible.
+
+    Anything other than cpu or cuda is rejected rather than guessed at, so a typo
+    in that one line is a message naming config.yaml instead of an estimator error
+    thirty minutes into a run.
+    """
+    if requested not in ("cpu", "cuda"):
+        raise ValueError(
+            f"device must be 'cpu' or 'cuda', got {requested!r}. config.yaml's "
+            f"`device` key is the only place this is set."
+        )
+    if requested == "cpu":
+        return "cpu"
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:  # noqa: BLE001 - no torch means no GPU, which means cpu
+        return "cpu"
 
 
 def load_ensemble_frames(
@@ -487,6 +517,7 @@ def fit_member(
     y: pd.Series,
     categorical: list[str],
     seed: int,
+    params: dict[str, Any] | None = None,
 ):
     """Fit one estimator on one fold, handling each family's quirks.
 
@@ -497,6 +528,9 @@ def fit_member(
         y: Fit labels.
         categorical: Categorical column names.
         seed: Random seed for the inner split.
+        params: The member's configured params. TabNet reads its three fit-time
+            arguments from here, because they are not constructor arguments and so
+            cannot be recovered from the estimator.
 
     Returns:
         The fitted estimator.
@@ -511,15 +545,18 @@ def fit_member(
     if kind == "tabnet":
         from pytorch_tabnet.tab_model import TabNetClassifier
 
+        options = params or {}
         Xn, positions, sizes = _tabnet_arrays(X, categorical)
         yn = y.to_numpy()
         inner_fit, inner_val = train_test_split(
             np.arange(len(yn)), test_size=0.1, random_state=seed, stratify=yn
         )
         fitted = TabNetClassifier(
-            verbose=0,
-            seed=seed + 1,
-            device_name=getattr(estimator, "device_name", "cpu"),
+            **{
+                key: value
+                for key, value in estimator.get_params().items()
+                if key not in ("cat_idxs", "cat_dims", "cat_emb_dim")
+            },
             cat_idxs=positions,
             cat_dims=sizes,
             cat_emb_dim=1,
@@ -528,9 +565,9 @@ def fit_member(
             Xn[inner_fit],
             yn[inner_fit],
             eval_set=[(Xn[inner_val], yn[inner_val])],
-            patience=5,
-            max_epochs=40,
-            batch_size=4096,
+            patience=options.get("patience", 5),
+            max_epochs=options.get("max_epochs", 40),
+            batch_size=options.get("batch_size", 4096),
         )
         return fitted
 
@@ -799,6 +836,7 @@ def train_member(
             y_fit,
             categorical,
             config.seed + fold,
+            spec.params,
         )
         oof[score_index] = predict_member(estimator, spec.kind, X_score)
         test += predict_member(estimator, spec.kind, X_test_te) / config.folds
@@ -976,9 +1014,13 @@ def run_gpu_shards(
         # session delivered one GPU's throughput and looked like the second card
         # was broken.
         handle = log_path.open("w", encoding="utf-8")
-        process = subprocess.Popen(
-            command, env=environment, stdout=handle, stderr=subprocess.STDOUT
-        )
+        try:
+            process = subprocess.Popen(
+                command, env=environment, stdout=handle, stderr=subprocess.STDOUT
+            )
+        except Exception:
+            handle.close()
+            raise
         started.append((index, names, process, handle, log_path))
         log_step("gpu_shard", gpu=index, members=len(group), log=str(log_path))
 
@@ -1049,7 +1091,8 @@ def train_ensemble(
     # the processor.
     config = replace(config, device=device)
     groups = plan_gpu_shards(config.members, device)
-    if len(groups) > 1:
+    sharded = len(groups) > 1
+    if sharded:
         # One worker process per GPU. They write the same .npy files the inline
         # path would, and the loop below then reads those back, so the stacking
         # code is identical either way.
@@ -1138,19 +1181,79 @@ def train_ensemble(
         summary["combiner"] = "rank"
         summary["competition_probabilities"] = ranked_test @ blend_weights
         log_step("ensemble_combiner", chosen="rank", nested_auc=round(nested_blend, 6))
-        save_json(summary, artifacts_dir / "ensemble_summary.json")
-        return summary
-    summary["combiner"] = "logistic"
-    summary["weights"] = {n: round(float(w), 6) for n, w in zip(names, weights)}
+    else:
+        summary["combiner"] = "logistic"
+        summary["weights"] = {n: round(float(w), 6) for n, w in zip(names, weights)}
+        log_step(
+            "ensemble_stack",
+            nested_auc=summary["nested_stack_auc"],
+            mean_logits=summary["mean_logit_auc"],
+            members=len(names),
+        )
+        summary["competition_probabilities"] = 1 / (1 + np.exp(-(ZT @ weights)))
+
+    # Pseudo-labeling needs the frames. On the sharded path they were deleted to
+    # keep the parent's ~2 GB copy out of the workers' way, and rebuilding them
+    # here would put that memory straight back, so this step is skipped there.
+    if config.pseudo_label_enabled and not sharded:
+        summary = _apply_pseudo_labeling(
+            summary, train_frame, competition_frame, features, categorical,
+            config, artifacts_dir, target_column, y, names,
+        )
     save_json(summary, artifacts_dir / "ensemble_summary.json")
-    log_step(
-        "ensemble_stack",
-        nested_auc=summary["nested_stack_auc"],
-        mean_logits=summary["mean_logit_auc"],
-        members=len(names),
-    )
-    # ZT, not Z. Z holds the training rows' logits; the submission is one row per
-    # competition row, so the weights have to be applied to ZT. Using Z here
-    # produces predictions for the wrong rows entirely.
-    summary["competition_probabilities"] = 1 / (1 + np.exp(-(ZT @ weights)))
+    return summary
+
+
+def _apply_pseudo_labeling(
+    summary, train_frame, competition_frame, features, categorical,
+    config, artifacts_dir, target_column, y, names,
+):
+    """Add confident competition predictions as pseudo-labelled training rows."""
+    probs = summary["competition_probabilities"]
+    confident_mask = (probs > config.pseudo_label_high) | (probs < config.pseudo_label_low)
+    n_confident = int(confident_mask.sum())
+    if n_confident == 0:
+        log_step("pseudo_label", added=0, reason="no confident predictions")
+        return summary
+
+    pseudo_labels = (probs[confident_mask] > 0.5).astype("int8")
+    pseudo_frame = competition_frame[confident_mask].copy()
+    pseudo_frame[target_column] = pseudo_labels
+
+    augmented_train = pd.concat([train_frame, pseudo_frame], ignore_index=True)
+    log_step("pseudo_label", added=n_confident, total=len(augmented_train))
+
+    # Retrain on augmented data
+    y_aug = augmented_train[target_column].astype("int8")
+    logits_train_aug = []
+    logits_test_aug = []
+    for spec in config.members:
+        oof_aug, test_aug = train_member(
+            spec,
+            augmented_train[features],
+            y_aug,
+            competition_frame[features],
+            [c for c in categorical if c in features],
+            config,
+            target_column,
+        )
+        logits_train_aug.append(to_logit(oof_aug))
+        logits_test_aug.append(to_logit(test_aug))
+
+    Z_aug = np.column_stack(logits_train_aug)
+    ZT_aug = np.column_stack(logits_test_aug)
+    scores_aug, weights_aug = nested_stack_score(Z_aug, y_aug.to_numpy(), config.stack_C)
+    nested_aug = float(roc_auc_score(y_aug, scores_aug))
+
+    if nested_aug > summary["nested_stack_auc"]:
+        summary["nested_stack_auc"] = round(nested_aug, 6)
+        summary["weights"] = {n: round(float(w), 6) for n, w in zip(names, weights_aug)}
+        summary["competition_probabilities"] = 1 / (1 + np.exp(-(ZT_aug @ weights_aug)))
+        summary["pseudo_label_applied"] = True
+        save_json(summary, artifacts_dir / "ensemble_summary.json")
+        log_step("pseudo_label_applied", new_nested_auc=round(nested_aug, 6))
+    else:
+        summary["pseudo_label_applied"] = False
+        log_step("pseudo_label_rejected", new_nested_auc=round(nested_aug, 6))
+
     return summary

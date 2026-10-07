@@ -14,7 +14,12 @@ rather than once by hand.
 
 import pandas as pd
 
-from src.constants import MAX_SERVICE_RATING, MIN_SERVICE_RATING, SERVICE_RATING_COLUMNS
+from src.constants import (
+    MAX_SERVICE_RATING,
+    MIN_SERVICE_RATING,
+    SERVICE_RATING_COLUMNS,
+    TARGET_COLUMN,
+)
 from src.entity.config_entity import DataIngestionArtifact, DataIngestionConfig
 from src.utils.common import check_columns, log_step, save_dataframe
 
@@ -184,8 +189,9 @@ def run_data_ingestion(config: DataIngestionConfig) -> DataIngestionArtifact:
                 f"{name} is empty. An empty file always means the download "
                 "failed, so the pipeline must stop here."
             )
-        target = "satisfaction"
-        check_required_columns(name, frame, set(config.required_columns), target)
+        check_required_columns(
+            name, frame, set(config.required_columns), str(TARGET_COLUMN)
+        )
         check_service_ratings_in_range(name, frame)
         check_missing_values_are_reasonable(name, frame)
         check_ids_are_unique(name, frame, "id")

@@ -168,7 +168,8 @@ def test_smoke_tests_do_not_write_config_yaml() -> None:
     # and flagging those would be noise that trains everyone to ignore the test.
     write = r"(write_text\(|open\([^)]*[\"'][wa]|yaml\.(safe_)?dump\()"
     offenders: list[str] = []
-    for path in list(Path("research").rglob("*.py")) + list(Path("src").rglob("*.py")):
+    root = Path(__file__).resolve().parent.parent
+    for path in list((root / "research").rglob("*.py")) + list((root / "src").rglob("*.py")):
         for number, line in enumerate(path.read_text().splitlines(), start=1):
             if "config.yaml" in line and re.search(write, line):
                 offenders.append(f"{path}:{number}")

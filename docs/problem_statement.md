@@ -45,10 +45,10 @@ is a prediction task:
 | Output | One `satisfaction` value per row of `test.csv` |
 | Submission file | `data/sample_submission.csv` — has `id` and `satisfaction` columns |
 
-`satisfaction` is `True` or `False`. The submission template fills the whole
-column with one number, `0.44357272006117476`, which is exactly the share of
-`True` rows in `train.csv`. A constant like that is a placeholder, not a
-prediction.
+`satisfaction` is `True` or `False`. The submission template contains
+continuous probability scores (not a constant), with values ranging from
+~0.004 to ~0.997. The mean happens to be close to the base rate (0.4438 vs
+0.4436), which may have caused confusion.
 
 Full row counts, primary keys and file hashes are in
 [data_inventory.md](data_inventory.md). The label is defined in

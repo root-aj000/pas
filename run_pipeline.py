@@ -160,7 +160,7 @@ def main() -> int:
         exit_code = 1
         status = "FAILURE"
         facts["error"] = f"{type(error).__name__}: {error}"
-        setup_logging().exception("run failed")
+        logging.getLogger().exception("run failed")
 
     log_run_footer(
         status,

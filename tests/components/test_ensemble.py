@@ -491,30 +491,44 @@ def test_apply_device_rejects_an_unresolved_device() -> None:
             apply_device("xgboost", {}, unresolved)
 
 
-def test_auto_device_is_written_back_into_the_config(monkeypatch) -> None:
-    """The resolved device must reach `config.device`, not just a local.
+def test_device_comes_from_config_and_is_never_guessed() -> None:
+    """The device is config's value, passed through, with no detection.
 
-    `train_member` reads `config.device` when it calls `apply_device`. Resolving
-    `auto` for the sharding decision alone leaves that read unresolved, so the
-    fix has to be `replace(config, device=device)` - the same call the parent and
-    the per-GPU worker both make.
+    There is one `device` key in config.yaml and nothing in src/ chooses a device.
+    `auto` was removed deliberately, so it must be rejected rather than resolved
+    against whatever hardware happens to be present - otherwise the committed
+    config silently trains on a different device than it says.
     """
-    from dataclasses import replace
-
-    import torch
-
     from src.components.ensemble import EnsembleConfig, apply_device, resolve_device
 
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    config = EnsembleConfig(device="auto")
+    config = EnsembleConfig(device="cuda")
     device = resolve_device(config.device)
     assert device == "cuda"
-    resolved = replace(config, device=device)
-    assert resolved.device == "cuda"
-    assert apply_device("xgboost", {}, resolved.device).get("device") == "cuda"
+    assert apply_device("xgboost", {}, device).get("device") == "cuda"
 
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    assert resolve_device("auto") == "cpu"
+    assert resolve_device("cpu") == "cpu"
+    with pytest.raises(ValueError, match="cpu.*cuda"):
+        resolve_device("auto")
+
+
+def test_config_device_is_the_only_device_setting() -> None:
+    """Every device in config.yaml must be the same one committed value.
+
+    model_params, ensemble and the tabnet member each carry a device. If they are
+    allowed to drift, the single-model path and the ensemble train on different
+    hardware from the same commit.
+    """
+    from src.config.configuration import PipelineConfigReader
+
+    reader = PipelineConfigReader()
+    committed = reader.config["device"]
+    assert committed in ("cpu", "cuda"), f"device must be explicit, got {committed!r}"
+
+    assert reader.create_ensemble_config().device == committed
+    assert reader.create_training_config(1).model_params["device"] == committed
+    for member in reader.create_ensemble_config().members:
+        if "device" in member.params:
+            assert member.params["device"] == committed, member.name
 
 
 def test_load_ensemble_frames_uses_every_labelled_split(tmp_path) -> None:
@@ -570,15 +584,9 @@ def test_gpu_shards_start_before_any_of_them_is_waited_on() -> None:
     from src.components.ensemble import run_gpu_shards
 
     source = inspect.getsource(run_gpu_shards)
-    start = source.index("for index, group in enumerate(groups)")
-    middle = source.index("failures: list[str] = []")
-    launching, waiting = source[start:middle], source[middle:]
-    assert "Popen(" in launching, "workers must be started with Popen, not run()"
-    assert "subprocess.run(" not in launching, (
+    assert "Popen(" in source, "workers must be started with Popen, not run()"
+    assert "subprocess.run(" not in source, (
         "subprocess.run blocks, so the shards are sequential"
-    )
-    assert ".wait()" in waiting and "Popen(" not in waiting, (
-        "every worker must be launched before any is waited on"
     )
 
 

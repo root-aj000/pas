@@ -195,8 +195,12 @@ def load_splits(quick: bool) -> tuple[pd.DataFrame, pd.DataFrame, list[str], str
     )
     config = yaml.safe_load(Path("config.yaml").read_text())
     if quick:
-        train = train.sample(n=20000, random_state=SEED)
-        validation = validation.sample(n=5000, random_state=SEED)
+        train = train.groupby(str(config["target_column"]), group_keys=False).apply(
+            lambda g: g.sample(n=min(20000, len(g)), random_state=SEED)
+        )
+        validation = validation.groupby(str(config["target_column"]), group_keys=False).apply(
+            lambda g: g.sample(n=min(5000, len(g)), random_state=SEED)
+        )
     return train, validation, list(config["features"]), str(config["target_column"])
 
 

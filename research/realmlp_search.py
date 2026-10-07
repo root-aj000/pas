@@ -154,8 +154,12 @@ def main(quick: bool, budget_seconds: int) -> int:
     config = yaml.safe_load(Path("config.yaml").read_text())
     features: list[str] = list(config["features"])
     if quick:
-        train = train.sample(n=20000, random_state=SEED)
-        validation = validation.sample(n=5000, random_state=SEED)
+        train = train.groupby(TARGET, group_keys=False).apply(
+            lambda g: g.sample(n=min(20000, len(g)), random_state=SEED)
+        )
+        validation = validation.groupby(TARGET, group_keys=False).apply(
+            lambda g: g.sample(n=min(5000, len(g)), random_state=SEED)
+        )
     train_X = train[features].to_numpy()
     train_y = train[TARGET].to_numpy()
     validation_X = validation[features].to_numpy()
