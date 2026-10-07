@@ -82,29 +82,39 @@ def add_derived_features(
         elif name == "rating_std":
             enriched[name] = rating_frame.std(axis=1)
         elif name == "online_boarding_x_class":
+            # Integer codes, never strings. LightGBM refuses str dtype outright
+            # ("pandas dtypes must be int, float or bool") and CatBoost wants a
+            # declared categorical list, so a concatenated label like
+            # "5_Business" fails at fit time. Codes split cleanly, and the
+            # categorical twin block gives the net an embedding per value anyway.
             enriched[name] = (
-                enriched["Online boarding"].astype(str) + "_" + enriched["Class"].astype(str)
+                enriched["Online boarding"].astype("int64") * 10
+                + enriched["Class"].map({"Business": 0, "Eco": 1, "Eco Plus": 2}).fillna(0).astype("int64")
             )
         elif name == "online_boarding_x_travel_type":
             enriched[name] = (
-                enriched["Online boarding"].astype(str) + "_" + enriched["Type of Travel"].astype(str)
+                enriched["Online boarding"].astype("int64") * 10
+                + enriched["Type of Travel"].map({"Business travel": 0, "Personal Travel": 1}).fillna(0).astype("int64")
             )
         elif name == "class_x_customer_type":
             enriched[name] = (
-                enriched["Class"].astype(str) + "_" + enriched["Customer Type"].astype(str)
+                enriched["Class"].map({"Business": 0, "Eco": 1, "Eco Plus": 2}).fillna(0).astype("int64") * 10
+                + enriched["Customer Type"].map({"Loyal Customer": 0, "disloyal Customer": 1}).fillna(0).astype("int64")
             )
         elif name == "age_bin":
+            # labels=False gives the bin index. Ordered, so ordinal is the honest
+            # encoding, and it is numeric.
             enriched[name] = pd.cut(
                 enriched["Age"],
                 bins=[0, 18, 25, 35, 45, 55, 65, 100],
-                labels=["0-18", "18-25", "25-35", "35-45", "45-55", "55-65", "65+"],
-            ).astype(str)
+                labels=False,
+            ).fillna(-1).astype("int64")
         elif name == "distance_bin":
             enriched[name] = pd.cut(
                 enriched["Flight Distance"],
                 bins=[0, 500, 1000, 1500, 2000, 3000, 5000],
-                labels=["0-500", "500-1000", "1000-1500", "1500-2000", "2000-3000", "3000+"],
-            ).astype(str)
+                labels=False,
+            ).fillna(-1).astype("int64")
         elif name == "any_delay":
             enriched[name] = (
                 (enriched["Departure Delay in Minutes"] > 0)
@@ -129,21 +139,6 @@ def add_derived_features(
             enriched[name] = (
                 enriched["Departure Delay in Minutes"] + enriched["Arrival Delay in Minutes"].fillna(0)
             ) / (enriched["Flight Distance"] + 1)
-        elif name == "online_boarding_x_class_int":
-            enriched[name] = (
-                enriched["Online boarding"].astype(int) * 10
-                + enriched["Class"].map({"Business": 0, "Eco": 1, "Eco Plus": 2}).fillna(0).astype(int)
-            )
-        elif name == "online_boarding_x_travel_type_int":
-            enriched[name] = (
-                enriched["Online boarding"].astype(int) * 10
-                + enriched["Type of Travel"].map({"Business travel": 0, "Personal Travel": 1}).fillna(0).astype(int)
-            )
-        elif name == "class_x_customer_type_int":
-            enriched[name] = (
-                enriched["Class"].map({"Business": 0, "Eco": 1, "Eco Plus": 2}).fillna(0).astype(int) * 10
-                + enriched["Customer Type"].map({"Loyal Customer": 0, "disloyal Customer": 1}).fillna(0).astype(int)
-            )
         else:
             raise ValueError(
                 f"No calculation is defined for derived feature '{name}'. "
@@ -152,8 +147,7 @@ def add_derived_features(
                 "online_boarding_x_class, online_boarding_x_travel_type, "
                 "class_x_customer_type, age_bin, distance_bin, any_delay, dep_delayed, "
                 "arr_delayed, delay_over_15min, age_squared, distance_squared, "
-                "age_over_distance, delay_over_distance, online_boarding_x_class_int, "
-                "online_boarding_x_travel_type_int, class_x_customer_type_int. "
+                "age_over_distance, delay_over_distance. "
                 "Add the calculation here and the description in config.yaml."
             )
     log_step(
