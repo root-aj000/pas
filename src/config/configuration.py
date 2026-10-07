@@ -294,6 +294,9 @@ class PipelineConfigReader:
         Returns:
             The stage 3 settings.
         """
+        model_params = dict(require_key(self.config, "model_params"))
+        if "device" in model_params:
+            model_params["device"] = resolve_device(str(model_params["device"]))
         return ModelTrainerConfig(
             train_data_path=resolve_project_path(
                 require_key(self.config, "artifacts_path")
@@ -303,7 +306,7 @@ class PipelineConfigReader:
             model_dir=resolve_project_path(require_key(self.config, "models_path"))
             / f"model_{model_version}",
             model_name=str(require_key(self.config, "model_name")),
-            model_params=dict(require_key(self.config, "model_params")),
+            model_params=model_params,
             features=list(require_key(self.config, "features")),
             target_column=str(require_key(self.config, "target_column")),
             random_seed=int(require_key(self.config, "random_seed")),

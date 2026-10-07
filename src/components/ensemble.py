@@ -434,13 +434,20 @@ def apply_device(kind: str, params: dict[str, Any], device: str) -> dict[str, An
     return out
 
 
-def build_estimator(kind: str, params: dict[str, Any], seed: int):
+def build_estimator(
+    kind: str, params: dict[str, Any], seed: int, device: str = "cpu"
+):
     """Create one unfitted estimator.
 
     Args:
         kind: Family name.
         params: Keyword arguments.
         seed: Random seed.
+        device: The device already resolved by `resolve_device`. TabNet reads this
+            rather than `params["device"]`, because `apply_device` returns params
+            untouched on the cpu branch - so a config saying `cuda` on a machine
+            with no GPU would otherwise hand TabNet `device_name="cuda"` and crash
+            in its constructor.
 
     Returns:
         The unfitted estimator.
@@ -471,10 +478,20 @@ def build_estimator(kind: str, params: dict[str, Any], seed: int):
     if kind == "tabnet":
         from pytorch_tabnet.tab_model import TabNetClassifier
 
+        # The architecture comes from config.yaml. `device` is dropped rather than
+        # forwarded (TabNet spells that device_name), and so are the three fit-time
+        # arguments - patience, max_epochs and batch_size belong to fit(), not to
+        # the constructor, and passing them here raises TypeError.
+        options = {
+            key: value
+            for key, value in params.items()
+            if key not in ("device", "patience", "max_epochs", "batch_size")
+        }
         return TabNetClassifier(
+            **options,
             verbose=0,
             seed=seed + 1,
-            device_name="cuda" if params.get("device") == "cuda" else "cpu",
+            device_name=device,
         )
     raise ValueError(f"unknown member kind: {kind}")
 
@@ -830,6 +847,7 @@ def train_member(
                 spec.kind,
                 apply_device(spec.kind, spec.params, config.device),
                 config.seed + fold,
+                config.device,
             ),
             spec.kind,
             X_fit,

@@ -9,8 +9,9 @@ This script tries to recover it directly with genetic programming.
 Method:
   1. Subsample 20k rows (gplearn is O(population * rows) per generation).
   2. Evolve 500 formulas for 30 generations with crossover + mutation.
-  3. Score every generation's best on AUC.
-  4. Validate the winning formula out-of-fold on the full training rows.
+  3. Report the winner's AUC in-sample, labelled as such - the search evolved on
+     those rows, so that number measures memorisation, not prediction.
+  4. Validate out-of-fold on a *different* 20k slice. This is the real number.
 
 The formula is printed, not just the AUC, because the point is to see the
 structure the generator used.
@@ -26,15 +27,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
+from gplearn.functions import make_function
+from gplearn.genetic import SymbolicClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
-
-from gplearn.genetic import SymbolicClassifier
-from gplearn.functions import make_function
 
 TARGET = "satisfaction"
 SEED = 42
 SUBSAMPLE = 20_000
+# The out-of-fold check runs a full evolutionary search once per fold, so it is
+# bounded to the same 20k rather than all 699k rows. Five searches at 500
+# individuals x 30 generations over every labelled row is hours on a laptop; over
+# 20k it is minutes, and 20k is already ample to tell a real formula from a
+# memorised one.
+OOF_ROWS = 20_000
 POPULATION = 500
 GENERATIONS = 30
 
@@ -64,7 +70,12 @@ RAW_COLUMNS = [
 
 
 def _protected_div(x1, x2):
-    return np.divide(x1, x2, out=np.zeros_like(x1), where=x2 != 0)
+    # float64 `out`, not zeros_like(x1): if a genome ever hands in an integer
+    # array, an integer out-array silently truncates the quotient instead of
+    # raising, and the search never sees the mistake.
+    return np.divide(
+        x1, x2, out=np.zeros(np.broadcast(x1, x2).shape, dtype=np.float64), where=x2 != 0
+    )
 
 
 def _protected_sqrt(x1):
@@ -99,13 +110,24 @@ def main() -> None:
     sqrt = make_function(function=_protected_sqrt, name="psqrt", arity=1)
     log = make_function(function=_protected_log, name="plog", arity=1)
 
-    function_set = ["add", "sub", "mul", "div", "sin", "cos", "sqrt", "log", "neg", "abs"]
+    # The protected objects, not their names. Passing the strings "div"/"sqrt"/
+    # "log" resolves to gplearn's UNPROTECTED builtins, which return inf on
+    # divide-by-zero and nan on log(negative) - every genome containing them
+    # scored nan and the search degenerated into the one-feature answer
+    # sin(neg(X7)). This was the bug that made the first run useless.
+    function_set = ["add", "sub", "mul", div, sqrt, log, "neg", "abs"]
+    # No sin/cos. The 13 ratings are 0-5 integers, so a periodic function over
+    # them can order six values arbitrarily and nothing more - it is a lookup
+    # table wearing a formula's clothes, which is exactly what it found.
 
     est = SymbolicClassifier(
         population_size=POPULATION,
         generations=GENERATIONS,
         tournament_size=20,
-        stopping_criteria=0.96,
+        # 0.0 = run all GENERATIONS. A nonzero value is compared against the best
+        # fitness, and gplearn stops the moment fitness clears it - at 0.96 a
+        # lucky generation ends the search before it has explored anything.
+        stopping_criteria=0.0,
         p_crossover=0.7,
         p_subtree_mutation=0.1,
         p_hoist_mutation=0.05,
@@ -135,8 +157,14 @@ def main() -> None:
     print(f"Time:       {elapsed:.1f}s", flush=True)
 
     print(flush=True)
-    print("Validating out-of-fold on full training rows...", flush=True)
+    print("Train AUC is IN-SAMPLE - the search evolved on these exact rows, so it")
+    print("measures memorisation, not prediction. The OOF number below is the real one.")
+    print(flush=True)
+    print(f"Validating out-of-fold on {OOF_ROWS:,} held-out rows...", flush=True)
     full = pd.read_csv("data/train.csv")
+    # A different slice from the search subsample, so the OOF rows are not the
+    # rows the winning formula was fitted on.
+    full = full.sample(n=OOF_ROWS, random_state=SEED + 1).reset_index(drop=True)
     X_full = build_features(full).to_numpy()
     y_full = full[TARGET].astype(int).to_numpy()
 
@@ -147,7 +175,7 @@ def main() -> None:
             population_size=POPULATION,
             generations=GENERATIONS,
             tournament_size=20,
-        stopping_criteria=0.0,
+            stopping_criteria=0.0,
             p_crossover=0.7,
             p_subtree_mutation=0.1,
             p_hoist_mutation=0.05,
@@ -165,10 +193,12 @@ def main() -> None:
         print(f"  fold {fold + 1}: AUC = {fold_auc:.6f}", flush=True)
 
     oof_auc = roc_auc_score(y_full, oof)
-    print(f"OOF AUC:    {oof_auc:.6f}  (on {len(y_full):,} full rows)", flush=True)
+    print(f"OOF AUC:    {oof_auc:.6f}  (on {len(y_full):,} held-out rows)", flush=True)
     print(flush=True)
     print("If OOF AUC > 0.96, the formula captures real structure.", flush=True)
-    print("If OOF AUC << train AUC, the formula overfit the subsample.", flush=True)
+    print("If OOF AUC << train AUC, the formula memorised the search rows.", flush=True)
+    print("If OOF AUC is near 0.5, the search found nothing and the -0.96 bar")
+    print("for this dataset stays a black-box one. Current best is 0.96004.")
 
 
 if __name__ == "__main__":
