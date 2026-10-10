@@ -15,6 +15,7 @@ config.yaml, the seed, the package versions and the exit code. Nothing is ever
 deleted.
 """
 
+import logging
 import sys
 import time
 from datetime import datetime
@@ -26,6 +27,7 @@ from src.pipeline.stage_02_data_cleaning_encoding import run_pipeline as run_sta
 from src.pipeline.stage_03_model_training import run_pipeline as run_stage_03
 from src.pipeline.stage_04_model_evaluation import run_pipeline as run_stage_04
 from src.pipeline.stage_05_ensemble import run_pipeline as run_stage_05
+from src.pipeline.stage_06_feature_views import run_pipeline as run_stage_06
 from src.utils.common import (
     build_run_log_name,
     ensure_project_root,
@@ -53,11 +55,17 @@ class RunLogWriter:
         log_path: The logs folder.
         prefix: What the run was, used in the file name.
         started_at: When the run started.
+
+    Note:
+    `logging` was imported inside this class's methods, and `main()` reads it on
+    the failure path at module scope. So a stage that raised would have made the
+    error handler itself raise `NameError`, and the run log would have stopped
+    before its footer - which is the one thing .dev/RULES.md rule 11 and
+    .lead/08-TRAPS.md Trap 11 both say a failed run must not do. Now imported at
+    module level, once.
     """
 
     def __init__(self, log_path: Path, prefix: str, started_at: datetime) -> None:
-        import logging
-
         log_path.mkdir(parents=True, exist_ok=True)
         self.file_path = log_path / build_run_log_name(prefix, started_at)
         self.handler = logging.FileHandler(self.file_path, encoding="utf-8")
@@ -74,15 +82,13 @@ class RunLogWriter:
         Returns:
             The log file that was written.
         """
-        import logging
-
         logging.getLogger().removeHandler(self.handler)
         self.handler.close()
         return self.file_path
 
 
 def main() -> int:
-    """Run all four stages in order, logging everything.
+    """Run every stage in order, logging everything.
 
     Returns:
         0 if every stage succeeded, 1 if any stage raised.
@@ -141,6 +147,15 @@ def main() -> int:
             ensemble_submission = run_stage_05()
             if ensemble_submission is not None:
                 facts["submission"] = Path(ensemble_submission).name
+
+            # Stage 6 adds views to what stage 5 just produced, so it has to run
+            # after it and needs its predictions on disk. It reports its own skip
+            # when feature_views.enabled is false, so it is called unconditionally
+            # rather than gated here - one place decides whether it runs.
+            log_step("run", stage="06_feature_views")
+            view_submission = run_stage_06()
+            if view_submission is not None:
+                facts["view_submission"] = Path(view_submission).name
         else:
             model_version = next_model_version(
                 reader.create_pipeline_config().models_root
@@ -156,7 +171,7 @@ def main() -> int:
     # failure here must be written into the run log with its exit code, not die
     # with a traceback and no record. The error is logged in full below, so it is
     # recorded rather than swallowed.
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         exit_code = 1
         status = "FAILURE"
         facts["error"] = f"{type(error).__name__}: {error}"

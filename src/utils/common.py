@@ -445,8 +445,37 @@ def save_json(payload: dict[str, Any], output_path: Path) -> Path:
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as file:
-        json.dump(payload, file, indent=2, default=str)
+        json.dump(payload, file, indent=2, default=_json_safe)
     return output_path
+
+
+def _json_safe(value: Any) -> Any:
+    """Return `value` in a form json can serialise, without losing it.
+
+    Args:
+        value: Whatever `json.dump` could not handle.
+
+    Returns:
+        A plain list for a numpy array, a plain float for a numpy scalar, and
+        `str(value)` for anything else.
+
+    Note:
+    `default=str` was the previous answer to "json.dump cannot serialise this",
+    and it turns a numpy array into its *repr*, which is not valid JSON - the
+    file parses back as one enormous string rather than a list. `save_json` is
+    what writes `ensemble_summary.json`, whose `competition_probabilities` is a
+    numpy array, so the written summary held `"0.0123, 0.9876, ..."` as a string.
+    The run itself was unaffected - the in-memory array went to the submission -
+    but every consumer that read the summary back, which is the entire reason it
+    is written, got a string. `np.ndarray.tolist()` is the fix, and it is the
+    difference between a summary anyone can plot and a file that only appears to
+    have parsed.
+    """
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    return str(value)
 
 
 def load_json(input_path: Path) -> dict[str, Any]:
@@ -473,6 +502,7 @@ def apply_categorical_encoding(
     categorical_columns: list[str],
     categorical_encoding: str,
     step_name: str,
+    category_maps: dict[str, list[str]] | None = None,
 ) -> pd.DataFrame:
     """Re-apply the categorical dtype after reading a prepared CSV.
 
@@ -481,6 +511,9 @@ def apply_categorical_encoding(
         categorical_columns: The columns that were categorical in stage 2.
         categorical_encoding: "native" or "one_hot", as stage 2 recorded it.
         step_name: Which step is reading, used in the error message.
+        category_maps: Column name to the level list stage 2 pinned, as recorded
+            in features.json. Restores the exact categories; without it the levels
+            are inferred from this frame's own rows.
 
     Returns:
         A new frame with the categorical columns as pandas `category` dtype, or
@@ -492,6 +525,21 @@ def apply_categorical_encoding(
     `enable_categorical` - pointing at the model rather than at the file format.
     So the dtype is re-applied from what stage 2 recorded, rather than being
     guessed at the point of use.
+
+    The levels come from `category_maps`, not from `astype("category")`. Inferring
+    them here made the encoding depend on which rows happened to be in this frame:
+    a level absent from the validation split's rows changed that split's codes and
+    its category count, so the same column meant different things to stage 3 and
+    stage 4 - the drift stage 2 pins its categories specifically to prevent, two
+    stages away from where it was introduced. It also dropped the `_cat_` twins
+    entirely, because they were never named in the contract: all 62 came back from
+    the CSV as int64, and an embedding per distinct value - the entire reason the
+    twins exist - was never created.
+
+    A frame read from an older features.json, or one whose contract predates
+    category maps, falls back to inference. That is a downgrade rather than a
+    failure, because the alternative is refusing to read artifacts this project
+    already has on disk; `log` it so the downgrade is visible.
 
     Raises:
         ValueError: If the encoding is not one we support, or a column recorded as
@@ -514,9 +562,33 @@ def apply_categorical_encoding(
             "Re-run stage 2 so the artifacts match config.yaml."
         )
 
+    maps = category_maps or {}
+    if not maps:
+        log_step(
+            "category_maps_missing",
+            step_name=step_name,
+            columns=len(categorical_columns),
+            reason="features.json predates category_maps; levels inferred per frame",
+        )
     typed = frame.copy()
     for column in categorical_columns:
-        typed[column] = typed[column].astype("category")
+        levels = maps.get(column)
+        if levels:
+            # `astype(str)` first, and it is load-bearing.
+            #
+            # A `_cat_` twin holds the string "3", which pandas writes to CSV as a
+            # bare `3` and reads back as int64. Casting int64 3 against the level
+            # list ["0","1","2",...] matches nothing, so every row became NaN and
+            # all twenty twins were dead columns - while `cat.codes` was -1
+            # everywhere, so a check comparing codes across splits saw -1 == -1 and
+            # called them consistent. Levels are stored as strings in the contract
+            # for exactly this reason, and the frame has to be put in the same type
+            # before the comparison can mean anything.
+            typed[column] = pd.Categorical(
+                typed[column].astype(str), categories=levels
+            )
+        else:
+            typed[column] = typed[column].astype("category")
     return typed
 
 

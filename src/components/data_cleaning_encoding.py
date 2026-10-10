@@ -20,6 +20,7 @@ no passenger identifier, so there is no time axis to cut on and no entity to hol
 out. The reasoning is written down in docs/split_plan.md.
 """
 
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -203,7 +204,9 @@ def add_arrival_delay_status(
 
     Args:
         frame: Rows to add a column to. Not modified.
-        config: Names the arrival delay column.
+        config: Supplies the delay column's name and the median that would be used
+            to fill a blank if imputation were on. Neither was read before, so the
+            docstring described a capability the body did not have.
 
     Returns:
         A new frame with `arrival_delay_status` added.
@@ -214,9 +217,16 @@ def add_arrival_delay_status(
         cancellation. Calling a blank flight "on time" would be a decision
         presented as a fact, so unknown is kept as its own group.
         See docs/column_dictionary.md Note 1.
+
+        `arrival_delay_median_for_model` is logged rather than applied, and the log
+        line says so. It is the value that WOULD be substituted for a blank; the
+        blanks are kept instead. It used to be read into `DataCleaningConfig` and
+        then used by nothing at all, so changing it in config.yaml had no effect and
+        nothing recorded that it had been considered. Recording the intended value
+        next to the decision not to use it keeps the setting visible and honest.
     """
     enriched = frame.copy()
-    delay_column = "Arrival Delay in Minutes"
+    delay_column = config.arrival_delay_column
     enriched["arrival_delay_status"] = np.select(
         [
             enriched[delay_column].isna(),
@@ -228,7 +238,13 @@ def add_arrival_delay_status(
     shares = (
         enriched["arrival_delay_status"].value_counts(normalize=True).round(4).to_dict()
     )
-    log_step("arrival_delay_status", rows_in=len(frame), shares=shares)
+    log_step(
+        "arrival_delay_status",
+        rows_in=len(frame),
+        delay_column=delay_column,
+        shares=shares,
+        imputation_median_not_applied=config.arrival_delay_median,
+    )
     return enriched
 
 
@@ -296,14 +312,35 @@ def add_digit_features(
     Note:
     Deterministic arithmetic: no fitting, no label, nothing to leak. For
     k >= 0 this is the k-th digit from the right; for k < 0, the k-th from the
-    left of the fractional part. Negative powers are exact in float64, so the
-    fractional digits are not rounded away.
+    left of the fractional part.
+
+    The fractional places are read by scaling UP and truncating, never by dividing
+    down. `value // 10.0**k` with a negative k was the previous version and it is
+    wrong in a way that produced plausible-looking columns: `1e-4` has no exact
+    float64 representation, so `25.0 // 1e-4` is 249999.0 rather than 250000.0,
+    and `% 10` of that is 9. Every row therefore got a run of 9s in the
+    fractional digits - all four of them constant for a whole-number column - and
+    `3.14` came out as [0, 0, 4, 1] rather than [0, 0, 1, 4]. Fourteen configured
+    features were constants and the rest encoded float representation error.
+    Scaling by `10**-k` and truncating the scaled value is exact for every value
+    these columns hold, because the products stay well inside int64.
+
+    Digits are taken off the magnitude, so a negative delay reads as its digits
+    with the sign carried separately rather than as a nine-complement. `//` and `%`
+    floor, so `-25 // 10` is -3 and `-3 % 10` is 7 - the tens digit of -25 came
+    out as 7.
+
+    One scaling, one shift per place: the value is scaled by 10^4 once and then
+    divided down to each place. Scaling separately per place cannot work - taking
+    the magnitude first and then multiplying an already-truncated integer by ten
+    throws the fraction away, so 3.14 lost its decimals entirely.
     """
     enriched = frame.copy()
     for column in DIGIT_COLUMNS if columns is None else columns:
         value = pd.to_numeric(enriched[column], errors="coerce").fillna(0.0)
+        scaled = np.rint(np.abs(value) * 10_000.0).astype("int64")
         for k in range(-4, 4):
-            enriched[f"{column}_d{k}"] = (value // (10.0**k) % 10).astype("int8")
+            enriched[f"{column}_d{k}"] = ((scaled // (10 ** (k + 4))) % 10).astype("int8")
     return enriched
 
 
@@ -324,14 +361,21 @@ def frequency_feature_names(columns: list[str]) -> list[str]:
 
 
 def add_frequency_features(
-    frame: pd.DataFrame, columns: list[str], counts: dict[str, pd.Series]
+    frame: pd.DataFrame,
+    columns: list[str],
+    counts: dict[str, pd.Series],
+    total: int,
 ) -> pd.DataFrame:
     """Add how common, and how rare, each value is.
 
     Args:
         frame: Rows to enrich. Not modified.
         columns: Which columns get a frequency and a rarity.
-        counts: Column name to its value_counts, fitted on the train split.
+        counts: Column name to its value_counts, fitted on the train split. The
+            index dtype must match the column's, because `.map` looks the raw
+            values up.
+        total: How many rows the counts were fitted on. The train row count, for
+            every frame.
 
     Returns:
         A new frame with two float32 columns per input column.
@@ -342,13 +386,32 @@ def add_frequency_features(
     from a value seen ten thousand times, where a plain frequency would squash
     both near zero. Reference measured +0.000128 for the block. Label-free: the
     counts come from the train split's own column.
+
+    Two things here were quietly destroying the block, and both had to be fixed
+    before any of that measurement meant anything.
+
+    `counts` was built with `.astype(str)`, so its index held strings, and the
+    lookup below is `.map` against the raw column. Seventeen of the columns are
+    int64, so every lookup missed, `fillna(0.0)` turned the miss into a zero, and
+    28 of the 32 features became the constant 0 - while `rarity`, being
+    `-log(clip(0, 1/total))`, became the constant `log(total)`. The features that
+    survived were the four object-typed ones, whose keys happened to match. The
+    index dtype now matches the column's; that is `value_counts`' own default.
+
+    `total` was `len(frame)` - the frame being enriched, not the frame the counts
+    came from. So `freq_Gender` was 0.497 on train (489,743 rows), 2.348 on
+    validation and test (104,946 rows) and 0.812 on competition (299,844 rows):
+    a rate above 1, three different meanings for one column, and `rarity` going
+    negative on two of the splits. This is the same train/serve skew that
+    `add_outlier_flags` was written to avoid, and `add_value_counts` gets right by
+    passing the train total in. Now so does this.
     """
     enriched = frame.copy()
-    total = max(len(frame), 1)
+    denominator = max(int(total), 1)
     for column in columns:
-        share = frame[column].map(counts[column]).fillna(0.0) / total
+        share = frame[column].map(counts[column]).fillna(0.0) / denominator
         enriched[f"freq_{column}"] = share.astype("float32")
-        enriched[f"rarity_{column}"] = (-np.log(share.clip(lower=1.0 / total))).astype(
+        enriched[f"rarity_{column}"] = (-np.log(share.clip(lower=1.0 / denominator))).astype(
             "float32"
         )
     return enriched
@@ -861,12 +924,21 @@ def add_route_features_to_all(
     frequency_columns = [
         c for c in CANDIDATE_FEATURE_COLUMNS if c in enriched_frames["train"].columns
     ]
+    # `value_counts` with no `.astype(str)`: the index dtype has to match the
+    # column's, because `add_frequency_features` looks the raw values up with
+    # `.map`. String keys against int64 values miss every time.
     frequency_counts = {
-        c: enriched_frames["train"][c].astype(str).value_counts()
-        for c in frequency_columns
+        c: enriched_frames["train"][c].value_counts() for c in frequency_columns
     }
+    # The denominator for every frame. A rate computed against the frame being
+    # enriched is not a rate - it is a function of how many rows that frame
+    # happened to have, so the same column means something different on each
+    # split. See `add_frequency_features`.
+    frequency_total = len(enriched_frames["train"])
     enriched_frames = {
-        name: add_frequency_features(frame, frequency_columns, frequency_counts)
+        name: add_frequency_features(
+            frame, frequency_columns, frequency_counts, frequency_total
+        )
         for name, frame in enriched_frames.items()
     }
     log_step(
@@ -1153,14 +1225,88 @@ def twin_feature_names(numeric_columns: list[str]) -> list[str]:
     return [f"{column}_cat_" for column in numeric_columns]
 
 
+def twin_source_columns(config_features: list[str]) -> list[str]:
+    """Return the columns that get a categorical twin, from the declared features.
+
+    Args:
+        config_features: `config.yaml`'s feature list.
+
+    Returns:
+        Every `<column>_cat_` entry in that list, stripped of its suffix.
+
+    Note:
+    The twin set used to be derived from the frame instead: every int64 or float64
+    column present at that moment. That produced 62 twins where config.yaml
+    declares 20, so 42 columns rode along in all four CSVs and in the stage's
+    feature contract without ever being features. Deriving the list from
+    config.yaml means the code cannot invent a column the configuration does not
+    know about.
+    """
+    suffix = "_cat_"
+    sources = [
+        name[: -len(suffix)] for name in config_features if name.endswith(suffix)
+    ]
+    # config.yaml can list a twin whose source it does not also feature. Silently
+    # dropping it would be the same class of quiet no-op; the caller checks.
+    return sources
+
+
+def twin_categories(
+    frames: dict[str, pd.DataFrame], sources: list[str]
+) -> dict[str, list[str]]:
+    """Return the allowed values of every twin, over all four frames.
+
+    Args:
+        frames: The four enriched frames, keyed by split. Any of them is fine as
+            the carrier of the values; they are unioned.
+        sources: Columns to take levels for.
+
+    Returns:
+        TWIN column name to its sorted level list - `Age_cat_`, not `Age`.
+
+    Note:
+    Keyed on the twin, not on the source column. The consumer here is
+    `encode_categorical_columns`, which walks this mapping and casts
+    `frame[key]` with `categories=levels`; the column that carries the cast is
+    the twin, so that is what the key has to name. Keying on the source name put
+    the twin's string levels onto the raw numeric column - `pd.Categorical(Age,
+    categories=["18", "19", ...])` - and every raw rating and numeric feature came
+    back 100% NaN, which is a hard failure at `check_feature_list` rather than
+    anything subtle. That is why stage 2 could not run at all.
+
+    All four frames, not train. See the note in `build_everything`: a level
+    occurring once in the labelled data lands in validation or test about 30% of
+    the time, and a train-only level list would turn those rows into "unseen" on
+    precisely the routes that are rare. This is a level vocabulary for a
+    label-free numeric column, not a fitted statistic, so reading it off the
+    unlabelled frames leaks nothing.
+    """
+    return {
+        f"{column}_cat_": sorted(
+            pd.concat([frame[column] for frame in frames.values()])
+            .fillna(0)
+            .astype(int)
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        for column in sources
+    }
+
+
 def add_categorical_twins(
-    frame: pd.DataFrame, numeric_columns: list[str]
+    frame: pd.DataFrame,
+    numeric_columns: list[str],
+    categories: dict[str, list[str]] | None = None,
 ) -> pd.DataFrame:
     """Add a categorical twin of every numeric column.
 
     Args:
         frame: Rows to enrich. Not modified.
         numeric_columns: Columns to twin. Must all exist and be numeric.
+        categories: Column name to its allowed values, fitted on the train split.
+            When given, every frame is cast with the same pinned list, so a twin
+            means the same thing on every split.
 
     Returns:
         A new frame with one `<column>_cat_` category column per numeric column.
@@ -1171,11 +1317,25 @@ def add_categorical_twins(
     Deterministic and labelless: no fitting, no globals, nothing to leak. A
     missing value would become the string "nan" and form its own category, which
     is honest handling rather than imputation.
+
+    `categories` is not optional in practice. Casting to `category` with no pinned
+    list lets pandas infer the levels from whatever rows are in the frame, so the
+    codes are positions in *that* frame's own sorted value list. Train and
+    competition then disagree on code for the same value whenever their value sets
+    differ at all - `Flight Distance` alone has 3,417 levels - and nothing in the
+    output says so, because both columns are `category` dtype and both are
+    accepted. Passing the train-fitted list is what makes the twin mean the same
+    thing everywhere.
     """
     enriched = frame.copy()
     for column in numeric_columns:
-        enriched[f"{column}_cat_"] = (
-            enriched[column].fillna(0).astype(int).astype(str).astype("category")
+        values = enriched[column].fillna(0).astype(int).astype(str)
+        twin = f"{column}_cat_"
+        # Keyed on the twin, matching `twin_categories`.
+        enriched[twin] = (
+            pd.Categorical(values, categories=categories[twin])
+            if categories and twin in categories
+            else values.astype("category")
         )
     return enriched
 
@@ -1247,8 +1407,10 @@ def encode_categorical_columns(
     Args:
         frame: Rows to encode.
         config: Names the categorical columns and says which encoding to use.
-        all_categories: Column name to every value seen across all splits, so
-            train and test get identical columns in identical order.
+        all_categories: Column name to its allowed values, so train and test get
+            identical columns in identical order. For the short categoricals these
+            come from train alone; for the `_cat_` twins they are the union over all
+            four frames - see `build_everything`.
 
     Returns:
         A new frame with the categorical columns either replaced by indicator
@@ -1266,16 +1428,56 @@ def encode_categorical_columns(
             configured encoding is not one we support. Either means the categories
             differ between files, which must stop the run rather than silently
             produce a different set of columns.
+
+    Note:
+    The unexpected-value guard is only meaningful for the columns whose vocabulary
+    came from train. It used to be built over every column while `all_categories`
+    itself was the union of all four splits, which made `set(frame[column]) - set(values)`
+    empty by construction and the `raise` unreachable - a check that could not fail
+    was reported as the thing that protects the encoding. It is now applied to the
+    short categoricals only, where a train-fitted vocabulary makes the question
+    real, and skipped for the twins, where the union is the intended vocabulary and
+    a level absent from it is a level nobody has.
     """
+    # Every column that carries string values has to become indicators, not just
+    # the four config.yaml names. `arrival_delay_status` is the one that was
+    # missed: it is computed by this pipeline, listed under `dropped_features`, and
+    # never named in `categorical_columns` - so under one_hot it survived the
+    # concat as a `str` column. Stage 3 then handed it to a scikit-learn encoder
+    # that calls `np.isnan` on the fitted categories and died on `TypeError: ufunc
+    # 'isnan' not supported for the input types`. The frame was unusable for every
+    # non-xgboost model, while nothing in stage 2 said so.
+    #
+    # `categorical_encoding: one_hot` means "every string column becomes
+    # indicators", and the set is derived from the frame rather than from a
+    # hand-kept list that a new string column silently falls out of.
+    if config.categorical_encoding == "one_hot":
+        string_columns = [
+            column
+            for column in frame.columns
+            if str(frame[column].dtype) in ("object", "str", "string")
+            and column != config.target_column
+        ]
+        all_categories = {
+            **all_categories,
+            **{
+                column: sorted(frame[column].dropna().unique().tolist())
+                for column in string_columns
+                if column not in all_categories
+            },
+        }
+
     unexpected = {
         column: sorted(set(frame[column].dropna().unique()) - set(values))
         for column, values in all_categories.items()
+        if column in config.categorical_columns
     }
     unexpected = {key: value for key, value in unexpected.items() if value}
     if unexpected:
         raise ValueError(
-            f"Categories appeared that were not seen anywhere: {unexpected}. "
-            "The category values differ between files, which must stop the run."
+            f"Categories appeared in a split that train never showed: {unexpected}. "
+            "The category values differ between files, which must stop the run. "
+            "Either add the value to the encoding or drop the rows."
         )
 
     if config.categorical_encoding == "native":
@@ -1296,6 +1498,17 @@ def encode_categorical_columns(
         return joined
 
     if config.categorical_encoding == "one_hot":
+        # Drop every column that is about to be replaced by indicators - the four
+        # config.yaml names AND every `_cat_` twin. It used to drop only the four,
+        # so the twins survived the concat alongside their own indicators and the
+        # frame carried both `Age_cat_` (a category) and
+        # `Age_cat__0` ... `Age_cat__68` (one column per level). 70 columns per
+        # twin, 20 twins, against a 178-feature config: one_hot produced a frame
+        # nearly four times wider than the feature list, and stage 3 then asked a
+        # scikit-learn estimator to read `category` dtype it cannot read.
+        replaced = set(all_categories)
+        # The label is a column, not a feature. It must not be one-hot expanded.
+        replaced.discard(config.target_column)
         encoded = pd.concat(
             [
                 pd.get_dummies(frame[column], prefix=column, dtype=int).reindex(
@@ -1305,9 +1518,7 @@ def encode_categorical_columns(
             ],
             axis=1,
         )
-        joined = pd.concat(
-            [frame.drop(columns=list(config.categorical_columns)), encoded], axis=1
-        )
+        joined = pd.concat([frame.drop(columns=sorted(replaced)), encoded], axis=1)
         log_step(
             "encode",
             rows_in=len(frame),
@@ -1347,22 +1558,6 @@ def build_everything(
         The competition frame goes through exactly the same steps as the labelled
         ones. Anything else is training-serving skew, and skew is silent.
     """
-    all_categories = {
-        column: sorted(
-            pd.concat(
-                [
-                    train_frame[column],
-                    validation_frame[column],
-                    test_frame[column],
-                    competition_frame[column],
-                ]
-            )
-            .unique()
-            .tolist()
-        )
-        for column in config.categorical_columns
-    }
-
     # Enrich every frame the same way first. Route statistics come after, because
     # they are built from the train frame and applied to all four.
     enriched_frames: dict[str, pd.DataFrame] = {}
@@ -1390,21 +1585,99 @@ def build_everything(
     if config.aux_features_enabled:
         enriched_frames = add_auxiliary_features_to_all(enriched_frames, config)
 
+    # The twins are a native-only feature.
+    #
+    # Under `native` a twin is a `category` column with a pinned level list, and
+    # the model partitions it - which is the whole reason it exists: an embedding
+    # per distinct route, per age, per rating.
+    #
+    # Under `one_hot` it is strictly worse, by a wide margin. `Flight Distance` has
+    # 3,417 levels, so its twin becomes 3,417 indicator columns; all 20 twins
+    # together produced 1,393 of them and a frame 1,561 columns wide against a
+    # 178-feature config. And config.yaml's feature list still names the twin
+    # itself - `Flight Distance_cat_` - not the indicators, so every one of those
+    # 1,393 columns was also a column no feature list referred to, while the 20
+    # features that WERE listed did not exist in the frame.
+    #
+    # So under one_hot the twins are skipped, and the feature check says so
+    # instead of failing on a list that cannot be satisfied. Not a compromise: the
+    # alternative is a config that cannot be run.
+    if config.categorical_twins_enabled and config.categorical_encoding == "one_hot":
+        log_step(
+            "categorical_twins",
+            added=0,
+            reason=(
+                "native-only feature; one_hot would add ~1400 indicator columns and "
+                "config.yaml's feature list names the twins, not the indicators"
+            ),
+        )
+        config = replace(config, categorical_twins_enabled=False)
+
+    twin_sources: list[str] = []
+    levels: dict[str, list[str]] = {}
+
     if config.categorical_twins_enabled:
-        # Deterministic per-frame transform: no fitting, no globals, nothing shared
-        # between frames, so each frame is twinned independently. Must run BEFORE
-        # encoding, because the twins themselves are categorical columns.
-        for name, frame in enriched_frames.items():
-            numeric_columns = [
-                c
-                for c in frame.columns
-                if c
-                not in list(config.categorical_columns)
-                + [config.target_column, "id", "arrival_delay_status"]
-                and str(frame[c].dtype) in ("int64", "float64")
-            ]
-            enriched_frames[name] = add_categorical_twins(frame, numeric_columns)
-        log_step("categorical_twins", added=len(numeric_columns))
+        # Deterministic per-row transform: no labels, nothing that can leak. Must
+        # run BEFORE encoding, because the twins themselves are categorical
+        # columns.
+        #
+        # Which columns get a twin comes from config.yaml, not from whatever the
+        # frame happens to hold - see `twin_source_columns`. The allowed values
+        # come from train and are shared by all four frames - see
+        # `add_categorical_twins`.
+        twin_sources = twin_source_columns(config.features)
+        # `mean_service_rating` and `worst_service_rating` are declared as twins in
+        # config.yaml but produced by `add_derived_features`, not read from the raw
+        # CSV - so they are not in the raw column set and must not be required there.
+        # The check that matters is that the frame HAS them as columns, which is the
+        # error below. The earlier version raised on them and made one_hot
+        # unreachable entirely.
+        missing_sources = [
+            column
+            for column in twin_sources
+            if column not in enriched_frames["train"].columns
+        ]
+        if missing_sources:
+            raise ValueError(
+                f"config.yaml asks for categorical twins of {missing_sources}, which "
+                f"stage 2 did not produce. Either the source column was dropped or "
+                f"the twin entry is stale."
+            )
+        levels = twin_categories(enriched_frames, twin_sources)
+        enriched_frames = {
+            name: add_categorical_twins(frame, twin_sources, levels)
+            for name, frame in enriched_frames.items()
+        }
+        log_step(
+            "categorical_twins",
+            added=len(twin_sources),
+            source="config.yaml features ending in _cat_",
+            largest=max((len(v) for v in levels.values()), default=0),
+        )
+    # Two vocabularies from two different sources, because they answer two
+    # different questions.
+    #
+    # The four short categoricals are fitted on TRAIN only. They used to be the
+    # union of all four splits, which meant the frozen test split influenced a
+    # fitted artefact - the one place in this file that happened - and made the
+    # "unexpected category" check in `encode_categorical_columns` unreachable,
+    # since a value's expected set always contained the frame it was found in.
+    # Train-only makes that check mean what it says.
+    #
+    # The twins are the union over all four splits, deliberately. Their vocabulary
+    # is an exhaustive list of the levels of a label-free numeric column, and
+    # `Flight Distance` has 3,417 of them; a level occurring once in the labelled
+    # data has a 30% chance of landing in validation or test rather than train, so
+    # a train-only list would blank roughly a third of the rare routes into "unseen"
+    # on exactly the rows that need them. That is not label leakage - no label is
+    # involved and no statistic is fitted - it is the level list of a column that
+    # already sits in the frame.
+    all_categories: dict[str, list[str]] = {
+        column: sorted(enriched_frames["train"][column].dropna().unique().tolist())
+        for column in config.categorical_columns
+        if column in enriched_frames["train"].columns
+    }
+    all_categories.update(levels)
 
     prepared: dict[str, pd.DataFrame] = {}
     for name, frame in enriched_frames.items():
@@ -1487,6 +1760,35 @@ def check_feature_list(
         )
     log_step("feature_check", features=len(config.features), missing_values=0)
 
+    # config.yaml's `candidate_features_pending_question` promises these columns
+    # are "computed and logged every run, but not used for fitting". That promise
+    # had no code behind it: the list was read into `DataCleaningConfig` and then
+    # used by nothing, so the only way to find out whether a pending column had
+    # accidentally become a feature was to read the feature list by hand. Two
+    # checks, both of which are the point of keeping the list:
+    pending = list(config.candidate_features_pending_question)
+    promoted = sorted(set(pending) & set(config.features))
+    if promoted:
+        raise ValueError(
+            f"config.yaml lists {promoted} under candidate_features_pending_question "
+            f"and also under features. A column cannot be both pending and in use - "
+            f"move it to features and delete the pending entry, so the two lists say "
+            f"the same thing."
+        )
+    not_computed = sorted(set(pending) - set(encoded_train.columns))
+    if not_computed:
+        raise ValueError(
+            f"config.yaml says {not_computed} are computed every run, but stage 2 "
+            f"did not produce them. Either the computation was removed or the list "
+            f"is stale."
+        )
+    log_step(
+        "pending_candidate_features",
+        columns=len(pending),
+        names=",".join(pending),
+        used_for_fitting=False,
+    )
+
 
 def run_data_cleaning_encoding(
     raw_train_path, raw_competition_path, config: DataCleaningConfig
@@ -1541,13 +1843,43 @@ def run_data_cleaning_encoding(
     competition_path = save_dataframe(
         encoded_competition, output_dir / "competition_test.csv"
     )
+    # The pinned category lists are read back off the encoded train frame rather
+    # than threaded out of `build_everything`. On the `native` path each column's
+    # dtype carries exactly the list stage 2 fitted, so this is the same data and
+    # it keeps that function's signature about the four frames.
+    #
+    # Recording them is what makes the encoding reproducible. The contract used to
+    # carry only the four column NAMES, so `apply_categorical_encoding` had to
+    # re-infer the levels with `astype("category")` on whatever frame it was given
+    # - and a value missing from one split's rows changed that split's codes and
+    # its category count, which is precisely the drift stage 2's own comment says
+    # the pinning exists to prevent. It also left all 20 `*_cat_` twins out of the
+    # contract entirely, so they came back from the CSV round-trip as int64 and
+    # the embeddings the twins exist to provide were never created.
+    category_maps = {
+        column: [str(value) for value in encoded_train[column].cat.categories]
+        for column in encoded_train.columns
+        if isinstance(encoded_train[column].dtype, pd.CategoricalDtype)
+    }
+    log_step(
+        "category_maps",
+        columns=len(category_maps),
+        largest=max((len(v) for v in category_maps.values()), default=0),
+    )
     save_json(
         {
             "features": config.features,
             "categorical_encoding": config.categorical_encoding,
-            "categorical_columns": list(config.categorical_columns),
+            # Every column stage 2 pinned, not just the four config.yaml names.
+            # Consumers restore from this list, so a column missing here is a
+            # column that arrives as a number.
+            "categorical_columns": sorted(category_maps),
+            "category_maps": category_maps,
             "derived_features": config.derived_feature_names,
-            "dropped_features": "see config.yaml dropped_features",
+            # The reasons, not the names. The card's "Known weaknesses" section is where a
+            # reader finds out what this model does not see, and `list(...)` threw
+            # the reasons away and left every entry reading "no reason recorded".
+            "dropped_features": dict(config.dropped_features),
             "target_column": config.target_column,
             "random_seed": config.random_seed,
         },

@@ -37,6 +37,8 @@ Two failure modes this module exists to prevent, both of which happened:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -44,7 +46,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 
@@ -56,6 +57,15 @@ from src.utils.common import log_step, save_json
 SPLIT_SEED = 42
 STACK_SEED = 42
 LOGIT_FLOOR = 1e-6
+
+# Prefix for the pseudo-label retrain's fold checkpoints, so the second training
+# pass keeps its own files instead of colliding with the first's.
+#
+# Without it both passes write `oof_<member>.fold.npy`, and a retrain resuming
+# from a first-pass fold would be scored against labels it never saw. The tag goes
+# into the file name AND the fingerprint, so the two cannot be confused even if the
+# names were ever made to collide.
+PSEUDO_CHECKPOINT_TAG = "pseudo__"
 
 
 @dataclass
@@ -69,6 +79,14 @@ class MemberSpec:
         drop_prefix: Column-name prefixes to exclude, so the same member can be
             trained on a narrower view of the data.
         drop_suffix: Column-name suffixes to exclude, same purpose.
+        keep_prefixes: When set, ONLY columns starting with one of these are kept,
+            and `drop_prefix`/`drop_suffix` are ignored. This exists because the
+            drop-based filter cannot express the views that matter most.
+            `drop_prefix: ["Age"]` also removes `Age_d0`, `Age_squared`,
+            `Age_is_outlier` and `Age_cat_`, but not `age_over_distance` -
+            case-sensitive, so an exclusion list for "the 13 ratings and nothing
+            else" would be a hundred prefixes and would silently change meaning
+            the day someone adds a feature. A keep-list says what it means.
         target_encodings: Whether to append the in-fold target-encoding block.
             Trees want it; the neural members are better off without it. They are
             the only members that see every column at once, and 21 per-column plus
@@ -83,6 +101,7 @@ class MemberSpec:
     params: dict[str, Any] = field(default_factory=dict)
     drop_prefix: tuple[str, ...] = ()
     drop_suffix: tuple[str, ...] = ()
+    keep_prefixes: tuple[str, ...] = ()
     target_encodings: bool = True
 
 
@@ -119,6 +138,19 @@ class EnsembleConfig:
     pseudo_label_enabled: bool = False
     pseudo_label_high: float = 0.95
     pseudo_label_low: float = 0.05
+    # When true, each member is fitted a second time on all training rows and its
+    # weights are written to artifacts/ensemble/models/model_<name>.pkl. Without
+    # it a run keeps only predictions, so predicting on any new row means
+    # retraining the whole ensemble.
+    save_models: bool = False
+    # On CPU, train one member per subprocess so peak memory is one member's
+    # rather than the parent's frames plus a member's. Ignored on GPU, where
+    # `run_gpu_shards` already splits members across processes.
+    cpu_one_process_per_member: bool = True
+    # Write a checkpoint after every completed fold and resume from it when the
+    # member is restarted. A 5-fold member on CPU takes an hour or more, and
+    # without this an OOM or a laptop sleep at fold 4 discards all of it.
+    resume: bool = True
     device: str = ""
     """config.yaml's `device` key, passed through unchanged.
 
@@ -144,15 +176,39 @@ def select_features(all_features: list[str], spec: MemberSpec) -> list[str]:
     worse copy. Measured on this dataset, the same network on the 22 raw columns
     added more to the stack than two extra architectures did. That is the whole
     reason this function exists rather than a single shared feature list.
+
+    `keep_prefixes` wins over `drop_prefix` when it is set, and `drop_suffix`
+    applies to whatever survives it. That combination is what a "the 13 ratings,
+    nothing else" view needs: `keep_prefixes` cannot exclude the `*_cat_` twins
+    on their own, because "Inflight wifi service" matches both the rating column
+    and its twin, and a tree reads the twin as a duplicate of the rating rather
+    than as extra information.
+
+    A keep-list and a drop-list that disagree have no sensible resolution, so
+    `drop_prefix` is ignored rather than combined when `keep_prefixes` is set.
+    Picking one silently is how a view ends up being something other than what its
+    config says.
     """
-    keep = [
-        f
-        for f in all_features
-        if not (spec.drop_prefix and f.startswith(spec.drop_prefix))
-        and not (spec.drop_suffix and f.endswith(spec.drop_suffix))
-    ]
+    if spec.keep_prefixes:
+        keep = [
+            f
+            for f in all_features
+            if f.startswith(spec.keep_prefixes)
+            and not (spec.drop_suffix and f.endswith(spec.drop_suffix))
+        ]
+    else:
+        keep = [
+            f
+            for f in all_features
+            if not (spec.drop_prefix and f.startswith(spec.drop_prefix))
+            and not (spec.drop_suffix and f.endswith(spec.drop_suffix))
+        ]
     if not keep:
-        raise ValueError(f"member {spec.name} has no features left after filtering")
+        raise ValueError(
+            f"member {spec.name} has no features left after filtering. "
+            f"keep_prefixes={list(spec.keep_prefixes)} matched nothing in the "
+            f"{len(all_features)} configured features."
+        )
     return keep
 
 
@@ -253,10 +309,27 @@ def load_ensemble_frames(
 
     contract = load_json(artifacts_dir / "features.json")
     encoding = str(contract.get("categorical_encoding", "one_hot"))
+    categorical_columns = list(contract.get("categorical_columns", []))
+    category_maps = contract.get("category_maps") or {}
+    # The contract, not the caller's list, decides what gets typed - it is what
+    # stage 2 actually pinned. The caller's list is cross-checked against it so a
+    # config edited after stage 2 last ran is caught here rather than by an
+    # estimator three hours later.
+    stale = set(categorical) - set(categorical_columns)
+    if stale:
+        raise ValueError(
+            f"config.yaml names {sorted(stale)} as categorical but stage 2's "
+            f"features.json does not list them. The artifacts predate the config; "
+            f"re-run stage 2."
+        )
 
     def read(path: Path, label: str) -> pd.DataFrame:
         return apply_categorical_encoding(
-            pd.read_csv(path, low_memory=False), categorical, encoding, label
+            pd.read_csv(path, low_memory=False),
+            categorical_columns,
+            encoding,
+            label,
+            category_maps,
         )
 
     train_only = read(train_path, "ensemble_train")
@@ -279,6 +352,196 @@ def load_ensemble_frames(
         competition_rows=len(competition_frame),
     )
     return train_frame, competition_frame
+
+
+def read_categorical_columns(artifacts_dir: Path, features: list[str]) -> list[str]:
+    """Return the columns stage 2 pinned as categorical, in feature order.
+
+    Args:
+        artifacts_dir: The `data_cleaning_encoding` folder stage 2 wrote.
+        features: The configured feature list, which sets the order.
+
+    Returns:
+        The intersection of the contract's categorical columns with `features`.
+
+    Note:
+    The contract, not config.yaml, is the authority here - and that is the whole
+    function. Stage 2 pins every column it types as `category`: the four short
+    categoricals plus the 20 `_cat_` twins, 24 in total, all recorded in
+    features.json.
+
+    Reading config.yaml's `categorical_columns` instead gave members a 4-item list
+    against a frame carrying 24 `category` columns. XGBoost and LightGBM accepted
+    it because `enable_categorical` infers the set from the frame; CatBoost
+    rejected it with `column 'Online boarding_cat_' has dtype 'category' but is
+    not in cat_features list`, which took out one member and, because the members
+    run sequentially, most of a run.
+
+    A member that drops columns - a stage 6 view - narrows this list by
+    intersection in `fit_member_to_artifacts`, so a view never asks CatBoost to
+    categorise a column it cannot see.
+    """
+    from src.utils.common import load_json
+
+    contract = load_json(artifacts_dir / "features.json")
+    recorded = set(contract.get("categorical_columns") or [])
+    return [column for column in features if column in recorded]
+
+
+def load_competition_frame(
+    artifacts_dir: Path, features: list[str], categorical: list[str]
+) -> pd.DataFrame:
+    """Load only the competition rows, for writing a submission.
+
+    Args:
+        artifacts_dir: The `data_cleaning_encoding` folder stage 2 wrote.
+        features: The configured feature list.
+        categorical: Categorical column names within it.
+
+    Returns:
+        The competition rows, encoded exactly as `load_ensemble_frames` encodes
+        them.
+
+    Note:
+    Separate from `load_ensemble_frames` so a caller that is about to hand the
+    frames to a subprocess trainer does not have to hold them just to get the
+    competition rows back afterwards. The three labelled splits are 699,635 rows;
+    the competition file is a separate file, so skipping it is the whole saving.
+    """
+    from src.utils.common import apply_categorical_encoding, load_json
+
+    competition_path = artifacts_dir / "competition_test.csv"
+    if not competition_path.exists():
+        raise FileNotFoundError(
+            f"{competition_path} not found. Run stage 2 first: python -m "
+            "src.pipeline.stage_02_data_cleaning_encoding"
+        )
+    contract = load_json(artifacts_dir / "features.json")
+    encoding = str(contract.get("categorical_encoding", "one_hot"))
+    frame = apply_categorical_encoding(
+        pd.read_csv(competition_path, low_memory=False),
+        list(contract.get("categorical_columns", [])),
+        encoding,
+        "ensemble_competition",
+        contract.get("category_maps") or {},
+    )
+    missing = [c for c in features if c not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"the competition frame is missing {len(missing)} configured columns: "
+            f"{missing[:5]}. Run stage 2 first."
+        )
+    return frame
+
+
+def train_ensemble_drops_frames(config: EnsembleConfig) -> bool:
+    """Whether `train_ensemble` frees the frames before training any member.
+
+    Args:
+        config: The ensemble settings.
+
+    Returns:
+        True when every member trains in a subprocess, so this process never needs
+        the frames while they train.
+
+    Note:
+    Exists so a caller can decide not to load the training frames at all. The
+    reason the frames were being held was `train_ensemble`'s own `del`, and `del`
+    inside a function frees nothing while the caller still has the object bound to
+    one of its own names - the ~2 GB stayed resident through every fold. The
+    caller has to be the one that never takes them.
+
+    True on cuda for every member count: with one GPU `train_ensemble` runs the
+    members inline and does need them, but its worker path and its single-GPU
+    inline path differ in nothing the caller can act on, and the cost of this
+    answer being wrong is a re-read of three CSVs.
+    """
+    if resolve_device(config.device) == "cuda":
+        return True
+    return bool(config.cpu_one_process_per_member)
+
+
+def config_payload(config: EnsembleConfig) -> dict[str, Any]:
+    """Return `config` as plain JSON-serialisable data.
+
+    Args:
+        config: The ensemble settings.
+
+    Returns:
+        A dict holding every member spec and every run-level setting.
+
+    Note:
+    A subprocess has to train the member the caller asked for, not the member
+    config.yaml happens to name. Reading config.yaml in the child made
+    `train_ensemble` a function of its arguments in name only: a caller passing a
+    two-member synthetic config got the nine members from the file, or an error
+    naming them, and the difference between the two was invisible from outside.
+    """
+    return {
+        "folds": config.folds,
+        "seed": config.seed,
+        "stack_C": config.stack_C,
+        "te_columns": list(config.te_columns),
+        "combiner": config.combiner,
+        "pseudo_label_enabled": config.pseudo_label_enabled,
+        "pseudo_label_high": config.pseudo_label_high,
+        "pseudo_label_low": config.pseudo_label_low,
+        "save_models": config.save_models,
+        "cpu_one_process_per_member": config.cpu_one_process_per_member,
+        "resume": config.resume,
+        "device": config.device,
+        "members": [
+            {
+                "name": m.name,
+                "kind": m.kind,
+                "params": m.params,
+                "drop_prefix": list(m.drop_prefix),
+                "drop_suffix": list(m.drop_suffix),
+                "keep_prefixes": list(m.keep_prefixes),
+                "target_encodings": m.target_encodings,
+            }
+            for m in config.members
+        ],
+    }
+
+
+def config_from_payload(payload: dict[str, Any]) -> EnsembleConfig:
+    """Rebuild an `EnsembleConfig` from `config_payload`.
+
+    Args:
+        payload: What `config_payload` wrote.
+
+    Returns:
+        The ensemble settings, member for member.
+    """
+    return EnsembleConfig(
+        folds=int(payload["folds"]),
+        seed=int(payload["seed"]),
+        stack_C=float(payload["stack_C"]),
+        te_columns=[str(c) for c in payload.get("te_columns", [])],
+        combiner=str(payload.get("combiner", "logistic")),
+        pseudo_label_enabled=bool(payload.get("pseudo_label_enabled", False)),
+        pseudo_label_high=float(payload.get("pseudo_label_high", 0.95)),
+        pseudo_label_low=float(payload.get("pseudo_label_low", 0.05)),
+        save_models=bool(payload.get("save_models", False)),
+        cpu_one_process_per_member=bool(
+            payload.get("cpu_one_process_per_member", True)
+        ),
+        resume=bool(payload.get("resume", True)),
+        device=str(payload.get("device", "")),
+        members=[
+            MemberSpec(
+                name=str(m["name"]),
+                kind=str(m["kind"]),
+                params=dict(m.get("params") or {}),
+                drop_prefix=tuple(m.get("drop_prefix") or ()),
+                drop_suffix=tuple(m.get("drop_suffix") or ()),
+                keep_prefixes=tuple(m.get("keep_prefixes") or ()),
+                target_encodings=bool(m.get("target_encodings", True)),
+            )
+            for m in payload.get("members", [])
+        ],
+    )
 
 
 def plan_gpu_shards(
@@ -367,11 +630,137 @@ def fit_member_to_artifacts(
         use_cat,
         config,
         target_column,
+        artifacts_dir,
     )
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     np.save(artifacts_dir / f"oof_{spec.name}.npy", oof)
     np.save(artifacts_dir / f"test_{spec.name}.npy", test)
+    # The member is finished, so its fold checkpoints are stale. Leaving them
+    # would let a later run resume from them and skip refitting a member whose
+    # config had since changed.
+    _clear_fold_checkpoint(spec.name, artifacts_dir)
+
+    if config.save_models:
+        save_member_weights(
+            spec,
+            train_frame,
+            competition_frame,
+            features,
+            use_cat,
+            config,
+            target_column,
+            artifacts_dir,
+        )
+
     return oof, test, float(roc_auc_score(train_frame[target_column], oof))
+
+
+def save_member_weights(
+    spec: MemberSpec,
+    train_frame: pd.DataFrame,
+    competition_frame: pd.DataFrame,
+    features: list[str],
+    categorical: list[str],
+    config: EnsembleConfig,
+    target_column: str,
+    artifacts_dir: Path,
+) -> Path:
+    """Fit one member on ALL training rows and write its weights to disk.
+
+    Args:
+        spec: Which member.
+        train_frame: Training rows, label included.
+        competition_frame: Competition rows. Used only for the column check, so a
+            member cannot be fitted against features the competition frame lacks.
+        features: The columns this member sees.
+        categorical: Categorical column names within them.
+        config: Seed, device, and the stack settings.
+        target_column: Label name.
+        artifacts_dir: Where `model_<name>.pkl` is written.
+
+    Returns:
+        The path written.
+
+    Note:
+    This is a SECOND fit, on every row, after the cross-validated one that
+    produced oof_<name>.npy. That is deliberate and not redundant. The
+    cross-validated fit exists to produce an honest score: each row is predicted
+    by a model that never saw it. Those fold models are therefore collectively
+    weaker than any single one of them, and none of them is trained on all the
+    data. This fit is the deployable artifact - it is what you load to predict on
+    rows that were never in train.csv, which the .npy prediction files cannot do.
+
+    One model per member, not ten. Saving all the fold models would multiply the
+    disk cost by `folds` and still leave you needing an ensemble at inference,
+    which is the thing this project is trying to avoid.
+
+    `competition_frame` is here to be checked, not fitted on. A saved model is a
+    promise that this member can score a competition row, and that promise is
+    unverifiable if the frame it will be asked about is missing a column. The
+    check was documented but not performed, so a member could be saved that fails
+    on every row it was supposed to be for - and the failure would surface later,
+    in a different process, as a KeyError from inside an estimator.
+
+    Size matters on Kaggle, where /kaggle/working is capped. The size is logged
+    per member so a run that fills the disk says which member did it.
+    """
+    import cloudpickle
+
+    missing = [c for c in features if c not in competition_frame.columns]
+    if missing:
+        raise ValueError(
+            f"member {spec.name} wants {len(missing)} columns the competition "
+            f"frame does not have: {missing[:5]}. Re-run stage 2 before saving "
+            f"member weights - a model fitted on them could not score a "
+            f"competition row."
+        )
+
+    estimator = build_estimator(
+        spec.kind,
+        apply_device(spec.kind, spec.params, config.device),
+        config.seed,
+        config.device,
+    )
+    fitted = fit_member(
+        estimator,
+        spec.kind,
+        train_frame[features],
+        train_frame[target_column].astype("int8"),
+        categorical,
+        config.seed,
+        spec.params,
+    )
+
+    models_dir = artifacts_dir / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    path = models_dir / f"model_{spec.name}.pkl"
+    # cloudpickle, not joblib, for the same reason stage 3 uses it: the tuned
+    # RealMLP recipe stores wd_sched, p_drop_sched and ls_eps_sched as compiled
+    # lambdas, and plain pickle cannot serialise those. cloudpickle stores them by
+    # value, so the file loads back without the defining module existing.
+    #
+    # The comment was right and the call was wrong. `joblib.dump` pickles with the
+    # standard library, so the RealMLP member died on its way to disk with
+    #
+    #   PicklingError: Can't pickle <function get_schedule.<locals>.<lambda>>:
+    #   it's not found as pytabkit.models.training.scheduling...
+    #
+    # after training all five folds successfully - 39 minutes of fitting discarded
+    # at the last step, and because the member's predictions had already been
+    # written the run still counted it as failed. `cloudpickle.dump` wants a file
+    # object rather than a Path, so the handle is opened here.
+    with path.open("wb") as handle:
+        cloudpickle.dump(fitted, handle)
+
+    size_mb = path.stat().st_size / 1024 / 1024
+    log_step(
+        "member_weights",
+        member=spec.name,
+        wrote=str(path),
+        size_mb=round(size_mb, 1),
+        features=len(features),
+    )
+    return path
 
 
 def apply_device(kind: str, params: dict[str, Any], device: str) -> dict[str, Any]:
@@ -781,6 +1170,208 @@ def add_in_fold_target_encodings(
     )
 
 
+def _fold_checkpoint_paths(name: str, artifacts_dir: Path) -> tuple[Path, Path]:
+    """Return the two checkpoint paths for one member."""
+    folder = artifacts_dir / "checkpoints"
+    return folder / f"oof_{name}.fold.npy", folder / f"test_{name}.fold.npy"
+
+
+def member_fingerprint(
+    spec: MemberSpec,
+    config: EnsembleConfig,
+    features: list[str],
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Return a stable id for everything about a member that changes its output.
+
+    Args:
+        spec: The member.
+        config: The run's fold count, seed, device and target-encoding columns.
+        features: The columns this member sees, in order.
+        extra: Anything else that changes the result and is not in `spec` or
+            `config`. The pseudo-label retrain uses this for the number of rows it
+            added and the thresholds that selected them.
+
+    Returns:
+        A hex digest. Equal digests mean resuming from a checkpoint is safe.
+
+    Note:
+    A checkpoint is only reusable if the predictions in it would have been the
+    same ones this run would produce. That is a function of the member's family,
+    every hyperparameter, its column filters, whether it gets the in-fold
+    encodings, the columns it sees, the fold count, the seed and the device.
+
+    Keying only on the fold count - which is what this did before - meant that
+    editing `n_estimators` in config.yaml, losing power at fold 3 and re-running
+    resumed the *old* parameters' folds and reported a complete member. Nothing
+    in the output said so, and the AUC in ensemble_summary.json belonged to a
+    model that no longer existed. A hash is the only way to make "the config
+    changed" detectable without asking the user to remember to delete a folder.
+    """
+    payload = {
+        "name": spec.name,
+        "kind": spec.kind,
+        "params": spec.params,
+        "drop_prefix": list(spec.drop_prefix),
+        "drop_suffix": list(spec.drop_suffix),
+        "keep_prefixes": list(spec.keep_prefixes),
+        "target_encodings": spec.target_encodings,
+        "features": features,
+        "folds": config.folds,
+        "seed": config.seed,
+        "device": config.device,
+        "te_columns": config.te_columns,
+        "split_seed": SPLIT_SEED,
+        # Sorted so the digest does not depend on insertion order, and repr'd
+        # because a value here is usually a count or a threshold.
+        "extra": {key: str(extra[key]) for key in sorted(extra)} if extra else {},
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=repr).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_fold_checkpoint(
+    name: str,
+    oof: np.ndarray,
+    test: np.ndarray,
+    folds: int,
+    artifacts_dir: Path,
+    fingerprint: str = "",
+) -> int | None:
+    """Restore a member's partial folds in place. Return the first missing fold.
+
+    Args:
+        name: Member name.
+        oof, test: Preallocated destination arrays, filled in place.
+        folds: How many folds this member has.
+        artifacts_dir: Where checkpoints live.
+        fingerprint: What the member is now configured to be. A checkpoint
+            written for a different member is rejected.
+
+    Returns:
+        The index of the first fold still to compute, `folds` when the checkpoint
+        already holds every fold, or None when no usable checkpoint exists.
+
+    Note:
+    The checkpoint stores `folds_completed` plus the summed competition
+    predictions, NOT the running mean. Dividing a stored mean by a larger fold
+    count on the next run would be wrong, so the sum is what gets written.
+
+    A checkpoint is rejected when the fold count, the row counts, or the member's
+    own configuration differ from this run's. Each of those means the stored
+    partial sums belong to a different computation, and resuming anyway would
+    silently corrupt the result - so refitting from scratch is the only safe
+    answer, and it is strictly better than producing a plausible wrong number.
+
+    `folds` is a legal return value and is not a rejection: a member that
+    finished all its folds and then died before writing its final `.npy` files is
+    exactly the case checkpointing exists for, and refitting an hour of work
+    because of a lost rename would defeat the point.
+    """
+    oof_path, test_path = _fold_checkpoint_paths(name, artifacts_dir)
+    meta_path = artifacts_dir / "checkpoints" / f"{name}.fold.json"
+    if not (oof_path.exists() and test_path.exists() and meta_path.exists()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+        if int(meta["folds"]) != int(folds):
+            log_step(
+                "checkpoint_rejected",
+                member=name,
+                reason="fold count changed",
+                saved=meta["folds"],
+                wanted=folds,
+            )
+            return None
+        if fingerprint and str(meta.get("fingerprint", "")) != fingerprint:
+            # Nothing is deleted here. Leaving it in place means the rejection is
+            # visible in the log on the next run too, and the user can see which
+            # member it was rather than inferring it from a missing number.
+            log_step(
+                "checkpoint_rejected",
+                member=name,
+                reason="member config changed since it was written",
+            )
+            return None
+        completed = int(meta["folds_completed"])
+        saved_oof = np.load(oof_path)
+        saved_test = np.load(test_path)
+    except Exception as error:  # noqa: BLE001 - a bad checkpoint must not kill the run
+        log_step("checkpoint_rejected", member=name, reason=type(error).__name__)
+        return None
+
+    if len(saved_oof) != len(oof) or len(saved_test) != len(test):
+        log_step("checkpoint_rejected", member=name, reason="row count changed")
+        return None
+    if not 0 <= completed <= folds:
+        return None
+
+    # Only the rows the completed folds actually scored are trustworthy; the rest
+    # are the NaN sentinel the loop preallocates.
+    scored = ~np.isnan(saved_oof[: len(oof)])
+    oof[:] = np.where(scored, saved_oof[: len(oof)], np.nan)
+    test[:] = saved_test[: len(test)]
+    log_step("checkpoint_resumed", member=name, folds_completed=completed, folds=folds)
+    return completed
+
+
+def _save_fold_checkpoint(
+    name: str,
+    oof: np.ndarray,
+    test: np.ndarray,
+    folds: int,
+    folds_completed: int,
+    artifacts_dir: Path,
+    fingerprint: str = "",
+) -> None:
+    """Persist partial predictions so an interrupted member can resume.
+
+    Note:
+    The arrays are written before the metadata, and the metadata names the fold
+    count they hold. A crash between the two leaves a checkpoint describing
+    FEWER folds than its arrays contain, which costs at most one fold of refitting;
+    the reverse order would let a torn `oof_*.npy` be believed, which costs
+    correctness. So the safe ordering is the one used here.
+    """
+    oof_path, test_path = _fold_checkpoint_paths(name, artifacts_dir)
+    oof_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(oof_path, oof)
+    np.save(test_path, test)
+    (oof_path.parent / f"{name}.fold.json").write_text(
+        json.dumps(
+            {
+                "folds": int(folds),
+                "folds_completed": int(folds_completed),
+                "fingerprint": fingerprint,
+            }
+        )
+    )
+
+
+def _clear_pseudo_checkpoints(config: EnsembleConfig, artifacts_dir: Path) -> None:
+    """Remove every pseudo-label retrain checkpoint.
+
+    Args:
+        config: Supplies the member names.
+        artifacts_dir: Where the checkpoints live.
+
+    Note:
+    Called once the retrain has been decided either way. Until then they are
+    resumable; afterwards they are spent folds. A later run that reproduces the
+    same selection will reuse them and reach the same conclusion in seconds, which
+    is why they are cleared here rather than on the next run.
+    """
+    for spec in config.members:
+        _clear_fold_checkpoint(f"{PSEUDO_CHECKPOINT_TAG}{spec.name}", artifacts_dir)
+
+
+def _clear_fold_checkpoint(name: str, artifacts_dir: Path) -> None:
+    """Remove a member's checkpoint once it has completed."""
+    oof_path, test_path = _fold_checkpoint_paths(name, artifacts_dir)
+    for path in (oof_path, test_path, oof_path.parent / f"{name}.fold.json"):
+        path.unlink(missing_ok=True)
+
+
 def train_member(
     spec: MemberSpec,
     X: pd.DataFrame,
@@ -789,6 +1380,9 @@ def train_member(
     categorical: list[str],
     config: EnsembleConfig,
     target_column: str,
+    artifacts_dir: Path | None = None,
+    checkpoint_tag: str = "",
+    fingerprint_extra: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Cross-validate one member and return its out-of-fold and test predictions.
 
@@ -800,6 +1394,16 @@ def train_member(
         categorical: Categorical column names within X.
         config: Fold count, seed, device.
         target_column: Label name, used only for error messages.
+        artifacts_dir: Where fold checkpoints live. None disables checkpointing
+            entirely, so `train_member` still works as a pure function.
+        checkpoint_tag: Distinguishes this member's checkpoints from another's when
+            the same member is trained more than once in a run - the pseudo-label
+            retrain does exactly that. Appended to the file names, so the two
+            training passes cannot read or overwrite each other's state.
+        fingerprint_extra: Extra facts folded into the fingerprint, for anything
+            outside `spec`/`config` that changes the result. The retrain passes the
+            pseudo-label selection, so a checkpoint is only reused when the same
+            rows would have been added.
 
     Returns:
         Out-of-fold probabilities, one per training row, and the competition
@@ -823,7 +1427,27 @@ def train_member(
         (a, b) for a, b in TE_PAIR_COLUMNS if a in X.columns and b in X.columns
     )
 
+    start_fold = 0
+    # What this member is now configured to be. Checkpoints written for anything
+    # else are refused, so editing a member's params and re-running cannot
+    # silently blend old folds with new ones.
+    # The tag goes into the file names, and into the fingerprint so a first-pass
+    # checkpoint is never handed to the retrain even if both were somehow under
+    # the same key.
+    checkpoint_key = f"{checkpoint_tag}{spec.name}" if checkpoint_tag else spec.name
+    fingerprint = member_fingerprint(spec, config, list(X.columns), fingerprint_extra)
+    if checkpoint_tag:
+        fingerprint = hashlib.sha256(f"{fingerprint}:{checkpoint_tag}".encode()).hexdigest()
+    if config.resume and artifacts_dir is not None:
+        resumed = _load_fold_checkpoint(
+            checkpoint_key, oof, test, config.folds, artifacts_dir, fingerprint
+        )
+        if resumed is not None:
+            start_fold = resumed
+
     for fold, (fit_index, score_index) in enumerate(splitter.split(X, y)):
+        if fold < start_fold:
+            continue
         X_fit = X.iloc[fit_index]
         y_fit = y.iloc[fit_index]
         X_score = X.iloc[score_index]
@@ -860,7 +1484,17 @@ def train_member(
         test += predict_member(estimator, spec.kind, X_test_te) / config.folds
         del estimator
         log_step("member_fold", member=spec.name, fold=fold + 1, folds=config.folds)
+        if config.resume and artifacts_dir is not None:
+            _save_fold_checkpoint(
+                checkpoint_key, oof, test, config.folds, fold + 1, artifacts_dir,
+                fingerprint,
+            )
 
+    # The loop above skips every fold a checkpoint already held, so reaching here
+    # with a complete `oof` means the member needed no fitting at all. That is the
+    # normal path for a member that finished and lost only its final file write,
+    # and re-running the fits would throw away an hour to recompute an identical
+    # answer.
     if np.isnan(oof).any():
         missing = int(np.isnan(oof).sum())
         raise ValueError(
@@ -885,9 +1519,158 @@ def to_logit(p: np.ndarray) -> np.ndarray:
     return np.log(clipped / (1 - clipped))
 
 
-def nested_stack_score(
+def newton_logistic_fit(
+    Z: np.ndarray, y: np.ndarray, C: float, max_iter: int = 50, tol: float = 1e-8
+) -> tuple[np.ndarray, float, dict[str, Any]]:
+    """Fit L2-regularised logistic regression by Newton's method.
+
+    Args:
+        Z: Member logits, rows by members.
+        y: Labels, 0 or 1.
+        C: Regularisation. The objective is mean log loss + ||w||^2/(2*C*n), so
+            larger C means weaker regularisation - the same sense as
+            scikit-learn's parameter.
+        max_iter: Iteration cap. Newton's method converges in a handful of steps
+            on a well-conditioned convex problem; this only bounds a pathological
+            case.
+        tol: Convergence threshold on the maximum absolute gradient.
+
+    Returns:
+        The weights, the unpenalised bias, and a record of the fit.
+
+    Note:
+    Replaces `sklearn.linear_model.LogisticRegression` for the stacker, and the
+    reason is that "converged" stops meaning what it should. L-BFGS returns
+    whatever it had when `max_iter` ran out, with no statement about the gradient -
+    so a stack built on four members and a stack built on a hundred and thirty-six
+    differ in whether the solver finished, and nothing in the output says so.
+    Measured on this problem, L-BFGS emits `ConvergenceWarning` on the rating
+    columns while still reaching a usable answer, which is exactly the situation
+    where you cannot tell a converged fit from a truncated one.
+
+    Newton's method computes the exact Hessian and solves for the step directly, so
+    convergence is a checkable fact rather than a hope: the gradient is asserted to
+    be below `tol`, and if it is not the fit raises. That makes a failure loud
+    instead of silent, which is the same reason this project checks that every
+    training row was scored.
+
+    The bias is left unpenalised. Penalising it is a modelling choice, not a
+    numerical necessity, and shifting the regularisation between weights and bias
+    changes the answer; `1/(C*n)` is applied to the weights only, with a zero in the
+    bias slot.
+
+    float64 throughout, and the Hessian is formed as `X^T diag(p(1-p)) X` with
+    `p(1-p)` clamped away from zero. With 699,635 rows and 136 members that is a
+    136x136 solve per iteration - about four of them - so cost is irrelevant
+    next to the training it sits on top of.
+
+    Lifted in substance from the reference solution in `sub/download/newton_stack.py`,
+    which is where the 0.9621 leaderboard number comes from. Restructured to take
+    numpy rather than assuming a CUDA device, to return numpy rather than torch
+    tensors, and to raise rather than return a flag on non-convergence.
+    """
+    Z = np.ascontiguousarray(Z, dtype=np.float64)
+    labels = np.asarray(y, dtype=np.float64)
+    if Z.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"newton_logistic_fit got {Z.shape[0]} rows but {labels.shape[0]} labels."
+        )
+    n_rows, n_columns = Z.shape
+    design = np.column_stack([Z, np.ones(n_rows)])
+
+    weights = np.zeros(n_columns + 1, dtype=np.float64)
+    # Start from a constant model at the base rate, with small weights. Newton
+    # needs a full-rank Hessian; starting from all-zero weights leaves p(1-p)=0.25
+    # everywhere, which is well conditioned, and the base rate puts the linear
+    # predictor where the data actually is.
+    weights[-1] = float(np.log(max(labels.mean(), 1e-6) / max(1 - labels.mean(), 1e-6)))
+    weights[:n_columns] = 1.0 / max(n_columns, 1)
+
+    penalty = np.full(n_columns + 1, 1.0 / (float(C) * n_rows), dtype=np.float64)
+    penalty[-1] = 0.0
+
+    def objective(at: np.ndarray) -> float:
+        z = design @ at
+        # log(1+exp(z)) computed stably, and log1p(-y) folded in as -y*z
+        return float(
+            (np.logaddexp(0.0, z) - labels * z).mean()
+            + 0.5 * (penalty * at**2).sum()
+        )
+
+    iterations = 0
+    for iterations in range(1, max_iter + 1):
+        z = design @ weights
+        probability = 1.0 / (1.0 + np.exp(-np.clip(z, -500, 500)))
+        gradient = design.T @ (probability - labels) / n_rows + penalty * weights
+        gradient_inf = float(np.abs(gradient).max())
+        if gradient_inf < tol:
+            break
+        variance = np.clip(probability * (1.0 - probability), 1e-12, None)
+        hessian = (design.T * variance) @ design / n_rows + np.diag(penalty)
+        try:
+            direction = np.linalg.solve(hessian, gradient)
+        except np.linalg.LinAlgError as error:
+            raise ValueError(
+                f"newton_logistic_fit: the Hessian is singular at C={C}. That "
+                f"means two member logits are identical, so the stack cannot "
+                f"separate them. Drop a duplicated member."
+            ) from error
+        if not np.all(np.isfinite(direction)):
+            raise ValueError(
+                f"newton_logistic_fit: the Newton direction is not finite at C={C}."
+            )
+
+        # Backtracking line search. Newton on a convex problem is globally
+        # convergent without one, but a step this size on 699,635 rows can
+        # overshoot if the Hessian is ill-conditioned at small C.
+        before = objective(weights)
+        slope = float(gradient @ direction)
+        if not np.isfinite(slope) or slope <= 0:
+            raise ValueError(
+                f"newton_logistic_fit: no descent direction at C={C} "
+                f"(gradient.direction = {slope:.3g})."
+            )
+        step = 1.0
+        accepted = False
+        for _ in range(30):
+            candidate = weights - step * direction
+            if objective(candidate) <= before - 1e-4 * step * slope + 1e-14:
+                weights = candidate
+                accepted = True
+                break
+            step *= 0.5
+        if not accepted:
+            raise ValueError(
+                f"newton_logistic_fit: the line search failed to improve the "
+                f"objective at C={C}. Halving 30 times is not a numerical detail."
+            )
+
+    z = design @ weights
+    probability = 1.0 / (1.0 + np.exp(-np.clip(z, -500, 500)))
+    final_gradient = float(
+        np.abs(design.T @ (probability - labels) / n_rows + penalty * weights).max()
+    )
+    if final_gradient >= tol:
+        raise ValueError(
+            f"newton_logistic_fit did not converge at C={C} in {max_iter} "
+            f"iterations: max gradient {final_gradient:.3g} >= {tol:.3g}. "
+            f"Raise max_iter, or pick a larger C."
+        )
+    record = {
+        "C": float(C),
+        "iterations": iterations,
+        "gradient_inf": final_gradient,
+        "loss": objective(weights),
+        "rows": int(n_rows),
+        "columns": int(n_columns),
+        "converged": True,
+    }
+    return weights[:-1], float(weights[-1]), record
+
+
+def newton_stack_score(
     Z: np.ndarray, y: np.ndarray, C: float = 1.0
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """Score a stack whose weights never saw the rows they score.
 
     Args:
@@ -896,17 +1679,28 @@ def nested_stack_score(
         C: Logistic regression regularisation.
 
     Returns:
-        One held-out score per row, and the weights fitted on everything.
+        One held-out score per row, the weights fitted on everything, and a record
+        of the final fit.
+
+    Note:
+    The nested structure is unchanged from the scikit-learn version it replaces -
+    same 5 folds, same `STACK_SEED`, same "weights never saw the rows they score".
+    Only the solver differs. That is deliberate: the honest-ness of this number
+    comes from the fold structure, and changing the solver does not change it.
+
+    `decision_function` was the score before. This returns `Z @ w + b`, the same
+    quantity, since AUC is invariant to the affine map that turns a decision value
+    into a probability.
     """
     out = np.zeros(len(y))
     for fit_index, score_index in StratifiedKFold(
         5, shuffle=True, random_state=STACK_SEED
     ).split(Z, y):
-        model = LogisticRegression(C=C, max_iter=1000)
-        model.fit(Z[fit_index], y[fit_index])
-        out[score_index] = model.decision_function(Z[score_index])
-    final = LogisticRegression(C=C, max_iter=1000).fit(Z, y)
-    return out, final.coef_[0]
+        weights, bias, _ = newton_logistic_fit(Z[fit_index], y[fit_index], C)
+        out[score_index] = Z[score_index] @ weights + bias
+    weights, bias, record = newton_logistic_fit(Z, y, C)
+    del bias
+    return out, weights, record
 
 
 def rank_blend_weights(P: np.ndarray, y: np.ndarray, seed: int = 0) -> np.ndarray:
@@ -1060,19 +1854,22 @@ def run_gpu_shards(
 
 def train_ensemble(
     config: EnsembleConfig,
-    train_frame: pd.DataFrame,
-    competition_frame: pd.DataFrame,
+    train_frame: pd.DataFrame | None,
+    competition_frame: pd.DataFrame | None,
     features: list[str],
     categorical: list[str],
     artifacts_dir: Path,
     target_column: str,
+    data_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Train every member, stack them, and save the artefacts.
 
     Args:
         config: The ensemble settings.
-        train_frame: The training rows, including the label.
-        competition_frame: The competition rows, no label.
+        train_frame: The training rows, including the label. May be None, in
+            which case they are read from `data_dir` - see the note below.
+        competition_frame: The competition rows, no label. Also optional, for the
+            same reason.
         features: The feature columns config.yaml asks for. Passed in rather than
             derived from the frame's columns, because the artifacts carry columns
             the model must never see - the id, the raw delays, and
@@ -1081,13 +1878,33 @@ def train_ensemble(
         categorical: Categorical column names.
         artifacts_dir: Where predictions and metadata are written.
         target_column: Label name.
+        data_dir: The `data_cleaning_encoding` folder to read frames from when
+            `train_frame` is None.
 
     Returns:
         A summary: each member's score, the nested stack score, the weights, and
         the competition probabilities.
+
+    Note:
+    Passing `train_frame=None` is how a caller keeps its own copy of the frames
+    from existing. On the CPU subprocess path nothing in this process needs the
+    frames while the members train, and `del train_frame` inside this function
+    cannot free memory that the *caller* still holds a reference to - which is the
+    entire memory the path exists to save. So the caller passes None and this
+    function reads them itself, holds them in a local it controls, and drops them
+    before the first member starts.
     """
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     all_features = list(features)
+    if train_frame is None or competition_frame is None:
+        if data_dir is None:
+            raise ValueError(
+                "train_ensemble was given no frames and no data_dir to read them "
+                "from. Pass both, or pass data_dir alone."
+            )
+        train_frame, competition_frame = load_ensemble_frames(
+            data_dir, all_features, categorical
+        )
     for column in all_features:
         if column not in train_frame.columns:
             raise ValueError(
@@ -1109,8 +1926,77 @@ def train_ensemble(
     # the processor.
     config = replace(config, device=device)
     groups = plan_gpu_shards(config.members, device)
+    # `sharded` is true only when there is more than one group, i.e. more than one
+    # GPU. On CPU `plan_gpu_shards` returns a single group, so the CPU branch below
+    # is keyed on `device` directly and NOT on `sharded`.
     sharded = len(groups) > 1
-    if sharded:
+    cpu_split = device == "cpu" and config.cpu_one_process_per_member
+    if cpu_split:
+        # On CPU there is one device, so without this every member would train
+        # sequentially inside THIS process - holding the parent's ~2 GB of frames
+        # for the whole run while each fold adds its own copy plus the in-fold
+        # target-encoding block. One member per subprocess returns that memory to
+        # the OS before the next one allocates. Same `fit_member_to_artifacts`,
+        # same seeds, same `.npy` files.
+        #
+        # The config is handed to the workers rather than re-read from
+        # config.yaml inside them, so a member trained here is the member this
+        # function was given.
+        from src.pipeline.cpu_member import run_cpu_members
+
+        # Both frames are unreferenced for the rest of the member loop, and this
+        # local is the only reference on this path when the caller passed None.
+        # Pseudo-labeling reloads them below rather than keeping them pinned.
+        #
+        # Assigned rather than `del`. `del` unbinds the name, so the later
+        # `if train_frame is None` raises UnboundLocalError instead of taking the
+        # reload branch - which is how this path ended up crashing at the very end
+        # of a full run. Setting it to None drops the same last reference and
+        # leaves the name readable.
+        #
+        # Only released when they can be read again. A caller that passes frames
+        # but no `data_dir` has no way to get them back, so holding them is what
+        # keeps pseudo-labeling possible; releasing them would turn a configured
+        # feature into an error.
+        if data_dir is not None:
+            train_frame = competition_frame = None
+        log_step(
+            "ensemble_device",
+            device=device,
+            mode="cpu_one_process_per_member",
+            members=len(config.members),
+        )
+        if data_dir is None:
+            # The frames were passed in and are being held for pseudo-labeling,
+            # so the workers cannot be told where to read from. Say so rather than
+            # letting a worker fail on a None path and taking the run with it.
+            raise ValueError(
+                "cpu_one_process_per_member is on but no data_dir was given, so the "
+                "per-member workers have nowhere to read the prepared frames from. "
+                "Pass data_dir, or set cpu_one_process_per_member: false to train "
+                "the members in this process."
+            )
+        run_cpu_members(
+            [m.name for m in config.members],
+            config,
+            artifacts_dir,
+            data_dir,
+            features,
+            categorical,
+            target_column,
+        )
+        for spec in config.members:
+            oof = np.load(artifacts_dir / f"oof_{spec.name}.npy")
+            test = np.load(artifacts_dir / f"test_{spec.name}.npy")
+            summary["members"][spec.name] = {
+                "oof_auc": round(float(roc_auc_score(y, oof)), 6),
+                "features": len(select_features(all_features, spec)),
+            }
+            names.append(spec.name)
+            logits_train.append(to_logit(oof))
+            logits_test.append(to_logit(test))
+        log_step("ensemble_cpu_members_done", members=len(config.members))
+    elif sharded:
         # One worker process per GPU. They write the same .npy files the inline
         # path would, and the loop below then reads those back, so the stacking
         # code is identical either way.
@@ -1124,8 +2010,10 @@ def train_ensemble(
         # its own copy of the frames - so the parent's copy is dead weight. At
         # 699,635 rows by 160 columns that is ~2 GB per process competing with
         # the workers for the same RAM and cores. Only the label survives, and it
-        # is needed below to score the .npy files the workers wrote.
-        del train_frame, competition_frame
+        # is needed below to score the .npy files the workers wrote. Assigned to
+        # None rather than deleted, so the pseudo-label block below can still read
+        # the name to find out there are no frames.
+        train_frame = competition_frame = None
         run_gpu_shards(groups, artifacts_dir)
         for spec in config.members:
             oof = np.load(artifacts_dir / f"oof_{spec.name}.npy")
@@ -1166,7 +2054,21 @@ def train_ensemble(
 
     Z = np.column_stack(logits_train)
     ZT = np.column_stack(logits_test)
-    scores, weights = nested_stack_score(Z, y.to_numpy(), config.stack_C)
+    scores, weights, stack_record = newton_stack_score(Z, y.to_numpy(), config.stack_C)
+    log_step(
+        "stack_solver",
+        method="newton",
+        C=config.stack_C,
+        iterations=stack_record["iterations"],
+        gradient_inf=stack_record["gradient_inf"],
+        rows=stack_record["rows"],
+        members=stack_record["columns"],
+        converged=stack_record["converged"],
+        note=(
+            "gradient below tolerance is a checked fact, not an iteration cap "
+            "that ran out; sklearn's L-BFGS reported the latter"
+        ),
+    )
     nested = float(roc_auc_score(y, scores))
     fold_list = list(
         StratifiedKFold(
@@ -1210,13 +2112,55 @@ def train_ensemble(
         )
         summary["competition_probabilities"] = 1 / (1 + np.exp(-(ZT @ weights)))
 
-    # Pseudo-labeling needs the frames. On the sharded path they were deleted to
-    # keep the parent's ~2 GB copy out of the workers' way, and rebuilding them
-    # here would put that memory straight back, so this step is skipped there.
+    # Pseudo-labeling needs the frames, and it retrains every member, so it is a
+    # second full run rather than a cheap step. On the sharded path the frames are
+    # not available - the workers hold their own and the parent's copy is dropped
+    # to keep ~2 GB out of their way - so it is skipped there, and says so.
+    #
+    # On the CPU subprocess path the frames ARE loadable, so rather than leaving a
+    # configured feature silently off, they are read back here. That is the
+    # deliberate trade: peak memory returns for this one step, in exchange for the
+    # setting in config.yaml actually doing what it says. The alternative -
+    # keeping the frames pinned for the whole run - costs ~2 GB on every fold of
+    # every member instead, which is the thing the subprocess path exists to fix.
     if config.pseudo_label_enabled and not sharded:
+        if train_frame is None or competition_frame is None:
+            if data_dir is None:
+                raise ValueError(
+                    "pseudo_label_enabled is true but the frames are gone and no "
+                    "data_dir was given to reload them from."
+                )
+            log_step(
+                "pseudo_label_reload_frames",
+                reason="frames were released for the subprocess member loop",
+            )
+            train_frame, competition_frame = load_ensemble_frames(
+                data_dir, all_features, categorical
+            )
         summary = _apply_pseudo_labeling(
-            summary, train_frame, competition_frame, features, categorical,
-            config, artifacts_dir, target_column, y, names,
+            summary,
+            train_frame,
+            competition_frame,
+            all_features,
+            categorical,
+            config,
+            artifacts_dir,
+            target_column,
+            y,
+            names,
+            stacked_auc=(
+                nested_blend if summary["combiner"] == "rank" else nested
+            ),
+            Z=Z,
+            ZT=ZT,
+            weights=weights,
+            splitter=fold_list,
+        )
+    elif config.pseudo_label_enabled:
+        log_step(
+            "pseudo_label",
+            skipped=True,
+            reason="sharded GPU path does not hold the frames",
         )
     save_json(summary, artifacts_dir / "ensemble_summary.json")
     return summary
@@ -1224,15 +2168,142 @@ def train_ensemble(
 
 def _apply_pseudo_labeling(
     summary, train_frame, competition_frame, features, categorical,
-    config, artifacts_dir, target_column, y, names,
+    config, artifacts_dir, target_column, y, names, stacked_auc, Z, ZT, weights,
+    splitter,
 ):
-    """Add confident competition predictions as pseudo-labelled training rows."""
-    probs = summary["competition_probabilities"]
+    """Add confident competition predictions as pseudo-labelled training rows.
+
+    Args:
+        summary: What the first pass produced. Mutated and returned.
+        train_frame: Training rows, label included.
+        competition_frame: Competition rows.
+        features: Every configured feature; each member narrows it with
+            `select_features`, exactly as the first pass did.
+        categorical: Categorical column names.
+        config: The ensemble settings.
+        artifacts_dir: Where the summary is rewritten.
+        target_column: Label name.
+        y: Labels for the original training rows.
+        names: Member names, in stack order.
+        stacked_auc: The out-of-fold score of whichever combiner was actually
+            chosen for the submission. This is the number the retrained stack has
+            to beat.
+        Z: Member logits on the training rows, rows by members.
+        ZT: Member logits on the competition rows, rows by members. This is what
+            the confidence mask is computed from - the rows being pseudo-labelled.
+        weights: The fitted logistic stack weights. Turn `ZT` into the calibrated
+            probabilities the thresholds are applied to.
+        splitter: The fold list the first pass used to score its combiners, so the
+            retrained ones are measured on the same structure.
+
+    Returns:
+        The summary, with either the pseudo-labelled predictions or the original
+        ones.
+
+    Note:
+    Four things had to be right here and were not.
+
+    *The probabilities must be the COMPETITION rows'.* The mask selects competition
+    rows to pseudo-label, so the confidence has to be the stack's prediction for
+    those rows. It was computed as `expit(Z @ weights)`, where `Z` is the member
+    logits on the 699,635 TRAINING rows. That is a different set of rows from the
+    299,844 the mask is applied to, and it does not fail loudly either: numpy
+    happily builds a 699,635-long boolean array and `competition_frame[mask]`
+    raises `ValueError: Item wrong length 699635 instead of 299844` - after every
+    member has already been retrained once, which is hours in. So `pseudo_label:
+    true` in config.yaml could never have completed.
+
+    The fix is not only to use `ZT`, but to use it *with the same weights the
+    stack was fitted with*, and to note that those weights are fitted on all
+    training rows while `ZT` comes from fold models - so the competition
+    predictions are honest and only the weight vector is in-sample. That is the
+    same arrangement the submission itself uses.
+
+    *The confidence thresholds need probabilities, not ranks.* When the rank blend
+    wins, the submission values are rank-scale numbers in [0, 1] - a rank, not a
+    probability. Thresholding those at 0.95 selects the top 5% *by rank*, which
+    is a statement about the blend's ordering and not about any model's confidence,
+    and then labelling them by `> 0.5` labels the top half of the competition set
+    positive. So the mask always comes from the logistic member stack on
+    `ZT`, which is calibrated and on a probability scale, whichever combiner
+    builds the submission.
+
+    *The comparison has to be against the chosen combiner.* `nested_stack_auc` is
+    the logistic stack's score. The rank blend is chosen precisely when it beats
+    that, and the rank blend's score is often the lower of the two. Comparing a
+    retrained logistic stack against the number for a submission that was not
+    logistic accepted the retrain on a criterion the submission never met. The
+    caller passes the chosen combiner's score as `stacked_auc`.
+
+    *The retrained stack has to be scored the way the submission is built.* The
+    first pass picks between a logistic stack and a rank blend by out-of-fold
+    score; the retrain evaluated only the logistic one and, if it won, rebuilt the
+    submission from it - so the combiner decision was silently reversed by a
+    second, unexamined choice. Both are now computed on the retrained members and
+    the same rule is applied to both.
+
+    *Each member has to see its own columns.* The first pass narrows features per
+    member with `select_features`; retraining with the full list gives a member
+    with `drop_prefix` set columns it never had, so the retrained member is a
+    different model than the one being replaced, and the comparison is between
+    two different things.
+
+    *The augmented frame is not a cross-validated training set.* Pseudo-labelled
+    competition rows are in `augmented_train`, so a row can be scored by a model
+    that trained on a near-duplicate of a competition row it also scored. The
+    nested score is therefore optimistic in absolute terms. It is still the right
+    thing to compare, because both numbers are computed the same way, and the
+    alternative - a second held-out split - costs as much as the thing it measures.
+    """
+    from scipy.special import expit
+
+    # Confidence for the rows being pseudo-labelled, from the logistic stack on
+    # `ZT`. Never from `summary["competition_probabilities"]`, which is rank-scale
+    # whenever the rank blend won and would make the 0.95/0.05 thresholds a
+    # statement about ordering rather than about confidence. `expit` rather than
+    # `1/(1+exp(-x))` because the latter overflows to 0 on large logits silently.
+    #
+    # `len(probs)` is asserted against the competition rows before anything is
+    # masked, because this was the exact mismatch that made the whole step
+    # unusable: a mask built on training-row probabilities was applied to
+    # competition rows and raised hours later, after the retraining.
+    probs = expit(ZT @ weights)
+    if len(probs) != len(competition_frame):
+        raise ValueError(
+            f"pseudo-label confidence has {len(probs)} values but the competition "
+            f"frame has {len(competition_frame)} rows. The mask is applied to the "
+            f"competition rows, so the two must match."
+        )
     confident_mask = (probs > config.pseudo_label_high) | (probs < config.pseudo_label_low)
     n_confident = int(confident_mask.sum())
     if n_confident == 0:
-        log_step("pseudo_label", added=0, reason="no confident predictions")
+        log_step(
+            "pseudo_label",
+            added=0,
+            reason=(
+                f"no competition row fell outside "
+                f"[{config.pseudo_label_low}, {config.pseudo_label_high}]"
+            ),
+            prob_min=round(float(probs.min()), 6),
+            prob_max=round(float(probs.max()), 6),
+            prob_median=round(float(np.median(probs)), 6),
+        )
         return summary
+
+    # How confident, and in which direction. Logged because a threshold that
+    # silently selects 3% of the competition set looks identical to one that
+    # selects 40% unless the count is written down.
+    positive = int((probs[confident_mask] > config.pseudo_label_high).sum())
+    log_step(
+        "pseudo_label_confident",
+        rows=len(probs),
+        selected=n_confident,
+        selected_share=round(n_confident / len(probs), 4),
+        pseudo_positive=positive,
+        pseudo_negative=n_confident - positive,
+        high=config.pseudo_label_high,
+        low=config.pseudo_label_low,
+    )
 
     pseudo_labels = (probs[confident_mask] > 0.5).astype("int8")
     pseudo_frame = competition_frame[confident_mask].copy()
@@ -1245,33 +2316,211 @@ def _apply_pseudo_labeling(
     y_aug = augmented_train[target_column].astype("int8")
     logits_train_aug = []
     logits_test_aug = []
+    # Checkpointed, because this is roughly half of stage 5's wall clock and it is
+    # the half that used to have no protection at all: `train_member` was called
+    # without an `artifacts_dir`, which is exactly what turns checkpointing off.
+    # Losing power at member 3 of 4 here used to cost the whole retrain.
+    #
+    # The tag keeps these checkpoints in separate files from the first pass's, so a
+    # first-pass fold can never be read as a retrain fold. The fingerprint carries
+    # the selection that produced this augmented set: the same rows, added at the
+    # same thresholds. If the first pass scores differently next run and selects a
+    # different number of rows, the retrain restarts rather than finishing a fold
+    # trained on a set that no longer exists.
+    pseudo_extra = {
+        "pseudo_rows_added": n_confident,
+        "pseudo_high": config.pseudo_label_high,
+        "pseudo_low": config.pseudo_label_low,
+        "pseudo_positive": int(positive),
+        "augmented_total": len(augmented_train),
+    }
+    log_step(
+        "pseudo_label_retrain_checkpoints",
+        enabled=bool(artifacts_dir),
+        tag=PSEUDO_CHECKPOINT_TAG,
+        directory=str(artifacts_dir) if artifacts_dir else None,
+        fingerprint_basis=sorted(pseudo_extra),
+    )
     for spec in config.members:
+        member_features = select_features(features, spec)
         oof_aug, test_aug = train_member(
             spec,
-            augmented_train[features],
+            augmented_train[member_features],
             y_aug,
-            competition_frame[features],
-            [c for c in categorical if c in features],
+            competition_frame[member_features],
+            [c for c in categorical if c in member_features],
             config,
             target_column,
+            artifacts_dir,
+            checkpoint_tag=PSEUDO_CHECKPOINT_TAG,
+            fingerprint_extra=pseudo_extra,
         )
         logits_train_aug.append(to_logit(oof_aug))
         logits_test_aug.append(to_logit(test_aug))
 
     Z_aug = np.column_stack(logits_train_aug)
     ZT_aug = np.column_stack(logits_test_aug)
-    scores_aug, weights_aug = nested_stack_score(Z_aug, y_aug.to_numpy(), config.stack_C)
-    nested_aug = float(roc_auc_score(y_aug, scores_aug))
 
-    if nested_aug > summary["nested_stack_auc"]:
-        summary["nested_stack_auc"] = round(nested_aug, 6)
-        summary["weights"] = {n: round(float(w), 6) for n, w in zip(names, weights_aug)}
-        summary["competition_probabilities"] = 1 / (1 + np.exp(-(ZT_aug @ weights_aug)))
+    # Scored on the REAL rows only - the first `len(y)` of the augmented set, which
+    # is exactly the original training frame because `augmented_train` concatenates
+    # the pseudo rows on the end.
+    #
+    # This is the difference between "the retrain looks better" and a number worth
+    # believing. Scoring on `y_aug` lets a competition row be scored by a fold model
+    # that trained on a near-identical pseudo-labelled row, so the pseudo rows vote
+    # for their own predictions; and it compares a score over 279k rows against a
+    # baseline over 699k, which is not a comparison at all. Both sides of the
+    # comparison are now the same rows - the genuine ones - so a difference means
+    # the added data changed how those rows are ranked.
+    #
+    # The members are still TRAINED on the augmented set. That is the point of the
+    # step; only the measurement is restricted.
+    real_rows = len(y)
+    y_real = y.to_numpy()
+    Z_real = Z_aug[:real_rows]
+    scores_real, weights_real, real_record = newton_stack_score(
+        Z_real, y_real, config.stack_C
+    )
+    log_step(
+        "pseudo_label_stack_solver",
+        method="newton",
+        C=config.stack_C,
+        iterations=real_record["iterations"],
+        gradient_inf=real_record["gradient_inf"],
+        converged=real_record["converged"],
+    )
+    nested_real = float(roc_auc_score(y_real, scores_real))
+    log_step(
+        "pseudo_label_score_on_real_rows",
+        rows=real_rows,
+        dropped_pseudo_rows=int(len(y_aug) - real_rows),
+        nested_auc=round(nested_real, 6),
+        note=(
+            "scored on genuine labels only; scoring the augmented frame would let "
+            "the pseudo rows score themselves"
+        ),
+    )
+    # Both combiners are scored on the retrained members, by the same rule the
+    # first pass used. Scoring only the logistic one and then rebuilding the
+    # submission from it reversed the combiner decision by default, without
+    # anything reporting that it had.
+    # The augmented-frame figures are computed only to be logged, so a reader can
+    # see how much self-scoring inflates them. Nothing is accepted on them.
+    blend_scores_aug, _ = nested_rank_blend(
+        _to_probabilities(Z_aug), y_aug.to_numpy(), splitter
+    )
+    scores_aug, _, _ = newton_stack_score(Z_aug, y_aug.to_numpy(), config.stack_C)
+    nested_aug = float(roc_auc_score(y_aug, scores_aug))
+    # The rank blend's ACCEPTANCE score, on the real rows for the same reason.
+    # Fitted on the real-row subset so its weights are not influenced by the pseudo
+    # rows, and scored on the same rows as the logistic stack.
+    blend_real_scores, blend_real_weights = nested_rank_blend(
+        _to_probabilities(Z_real), y_real, splitter
+    )
+    nested_blend_real = float(roc_auc_score(y_real, blend_real_scores))
+    nested_blend_aug = float(roc_auc_score(y_aug, blend_scores_aug))
+    log_step(
+        "pseudo_label_rank_candidates",
+        on_real_rows=round(nested_blend_real, 6),
+        on_augmented_rows=round(nested_blend_aug, 6),
+        note="acceptance uses the real-rows figure",
+    )
+    log_step(
+        "pseudo_label_candidates",
+        logistic_auc_on_real=round(nested_real, 6),
+        rank_auc_on_real=round(nested_blend_real, 6),
+        logistic_auc_on_augmented=round(nested_aug, 6),
+        rank_auc_on_augmented=round(nested_blend_aug, 6),
+        had_to_beat=round(float(stacked_auc), 6),
+        note=(
+            "every figure below is on the genuine rows; the augmented-frame "
+            "numbers are logged only to show how much self-scoring inflates them"
+        ),
+    )
+
+    # Acceptance compares like with like: a retrained combiner's score on the
+    # genuine rows against the first pass's score on the genuine rows.
+    if nested_blend_real > stacked_auc or nested_real > stacked_auc:
+        use_rank = nested_blend_real >= nested_real
+        if use_rank:
+            summary["nested_rank_blend_auc"] = round(nested_blend_real, 6)
+            summary["combiner"] = "rank"
+            summary["rank_blend_weights"] = {
+                n: round(float(w), 6) for n, w in zip(names, blend_real_weights)
+            }
+            # Rank scale, on the competition rows, exactly as the first pass does.
+            summary["competition_probabilities"] = np.column_stack(
+                [to_rank(1 / (1 + np.exp(-ZT_aug[:, i]))) for i in range(ZT_aug.shape[1])]
+            ) @ blend_real_weights
+            accepted = nested_blend_real
+        else:
+            summary["nested_stack_auc"] = round(nested_real, 6)
+            summary["combiner"] = "logistic"
+            summary["weights"] = {
+                n: round(float(w), 6) for n, w in zip(names, weights_real)
+            }
+            summary["competition_probabilities"] = expit(ZT_aug @ weights_real)
+            accepted = nested_real
+        # Per-member scores on the genuine rows, for the same reason.
+        summary["solo_oof_auc"] = {
+            n: round(float(roc_auc_score(y_real, Z_aug[:real_rows, i])), 6)
+            for i, n in enumerate(names)
+        }
         summary["pseudo_label_applied"] = True
+        summary["pseudo_label_added"] = n_confident
+        # Both numbers kept. `nested_stack_auc`/`nested_rank_blend_auc` are
+        # overwritten above, so without these the summary would report only the
+        # after-state and nothing would show what pseudo-labeling was worth.
+        summary["pseudo_label_before"] = round(float(stacked_auc), 6)
+        summary["pseudo_label_after"] = round(float(accepted), 6)
+        summary["pseudo_label_scored_on"] = f"{real_rows} genuine rows"
         save_json(summary, artifacts_dir / "ensemble_summary.json")
-        log_step("pseudo_label_applied", new_nested_auc=round(nested_aug, 6))
+        _clear_pseudo_checkpoints(config, artifacts_dir)
+        log_step(
+            "pseudo_label_applied",
+            combiner=summary["combiner"],
+            new_auc_on_real=round(float(accepted), 6),
+            beat=round(float(stacked_auc), 6),
+            added=n_confident,
+        )
     else:
         summary["pseudo_label_applied"] = False
-        log_step("pseudo_label_rejected", new_nested_auc=round(nested_aug, 6))
+        summary["pseudo_label_added"] = 0
+        summary["pseudo_label_before"] = round(float(stacked_auc), 6)
+        summary["pseudo_label_after"] = round(
+            float(max(nested_real, nested_blend_real)), 6
+        )
+        summary["pseudo_label_scored_on"] = f"{real_rows} genuine rows"
+        # Cleared on reject too. The retrain is finished either way, so its folds
+        # are spent; leaving them means the NEXT run resumes a retrain it has
+        # already decided against, which is the same stale-checkpoint class of bug
+        # as a changed member config.
+        _clear_pseudo_checkpoints(config, artifacts_dir)
+        log_step(
+            "pseudo_label_rejected",
+            logistic_auc_on_real=round(nested_real, 6),
+            rank_auc_on_real=round(nested_blend_real, 6),
+            had_to_beat=round(float(stacked_auc), 6),
+        )
 
     return summary
+
+
+def _to_probabilities(logits: np.ndarray) -> np.ndarray:
+    """Return member logits as probabilities.
+
+    Args:
+        logits: Rows by members, on the logit scale.
+
+    Returns:
+        The same shape, squashed into [0, 1].
+
+    Note:
+    `nested_rank_blend` documents its input as "raw scale" and rank-transforms it
+    internally, so any monotone scale gives the identical ranks. This exists to
+    make that explicit at the call site and to use `expit`, which does not
+    overflow on large logits where `1/(1+exp(-x))` silently returns 0.
+    """
+    from scipy.special import expit
+
+    return expit(logits)

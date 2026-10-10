@@ -19,7 +19,13 @@ into the training rows. Every number it reports is measured out of fold. See
 `load_ensemble_frames`.
 """
 
-from src.components.ensemble import load_ensemble_frames, train_ensemble
+from src.components.ensemble import (
+    load_competition_frame,
+    load_ensemble_frames,
+    read_categorical_columns,
+    train_ensemble,
+    train_ensemble_drops_frames,
+)
 from src.components.model_evaluation import write_submission
 from src.config.configuration import PipelineConfigReader
 from src.utils.common import get_logger, log_step, setup_logging
@@ -49,26 +55,64 @@ def run_pipeline() -> str | None:
 
     pipeline = reader.create_pipeline_config()
     target_column = str(pipeline.training.target_column)
-    cleaning = reader.create_cleaning_config()
     features = list(pipeline.training.features)
-    categorical = [c for c in cleaning.categorical_columns if c in features]
+    data_dir = pipeline.artifacts_root / "data_cleaning_encoding"
+    # The categorical list comes from stage 2's CONTRACT, not from config.yaml's
+    # four names.
+    #
+    # Stage 2 pins every column it typed as `category` - the four short categoricals
+    # and the 20 `*_cat_` twins - and records all of them in features.json. The
+    # contract is the authority on what is categorical, because it is what the CSVs
+    # were written from. Reading config.yaml's four names instead produced a frame
+    # where `Online boarding_cat_` was `category` dtype but absent from the list
+    # handed to CatBoost, and CatBoost refuses that:
+    #
+    #   features data: column 'Online boarding_cat_' has dtype 'category' but is
+    #   not in cat_features list
+    #
+    # XGBoost and LightGBM did not catch it because `enable_categorical` infers
+    # the set from the frame, so only CatBoost failed - and it failed after an
+    # hour and a half of training the other three members.
+    categorical = read_categorical_columns(data_dir, features)
 
     # The frame assembly - including folding the validation and test splits back
     # into training - lives in the components layer because the per-GPU workers
     # have to build exactly the same frames.
-    train_frame, competition_frame = load_ensemble_frames(
-        pipeline.artifacts_root / "data_cleaning_encoding", features, categorical
-    )
+    #
+    # When the members train in subprocesses this stage passes None instead of the
+    # frames. `train_ensemble` drops its own references before the first member
+    # starts, but that frees nothing while the frames are still bound to a name in
+    # THIS frame - so the ~2 GB the subprocess path exists to keep out of the
+    # workers' way stayed resident through every fold of every member. The only
+    # frame read back afterwards is the competition one, for the submission.
+    if train_ensemble_drops_frames(config):
+        competition_frame = None
+        log_step(
+            "stage_05_frames",
+            loaded_by="train_ensemble",
+            reason="members train in subprocesses",
+        )
+    else:
+        train_frame, competition_frame = load_ensemble_frames(
+            data_dir, features, categorical
+        )
 
     summary = train_ensemble(
         config,
-        train_frame,
+        None if competition_frame is None else train_frame,
         competition_frame,
         features,
         categorical,
         pipeline.artifacts_root / "ensemble",
         target_column,
+        data_dir,
     )
+
+    if competition_frame is None:
+        # Read back for the submission only. `write_submission` needs the ids and
+        # the row order; it does not need the label, which competition rows have
+        # no column for.
+        competition_frame = load_competition_frame(data_dir, features, categorical)
 
     output_dir = pipeline.report_root / "submissions"
     output_dir.mkdir(parents=True, exist_ok=True)

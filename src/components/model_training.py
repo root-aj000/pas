@@ -170,9 +170,16 @@ MODEL_REGISTRY: dict[str, Callable[..., "Estimator"]] = {
     "realmlp": build_realmlp_classifier,
 }
 
-# Models that have no random_state parameter. Passing one would raise TypeError,
-# and per .dev/RULES.md rule 8 the run must stop with a clear message rather than
-# fail obscurely.
+# Models whose constructor takes no `random_state`. Passing one would raise
+# TypeError, and per .dev/RULES.md rule 8 the run must stop with a clear message
+# rather than fail obscurely.
+#
+# Empty, and populated by what it is rather than by what someone remembered to
+# type: `build_model` inspects the constructor's signature and names any model
+# that cannot take the seed. A hand-maintained list is a list that goes stale -
+# this one has been an empty frozenset since it was added, so the branch below it
+# could never fire and the "must stop with a clear message" it documents had no
+# path to produce one.
 MODELS_WITHOUT_RANDOM_STATE: frozenset[str] = frozenset()
 
 # Overrides the overfitting check applies so it can do its job.
@@ -244,18 +251,64 @@ def build_model(
         )
     params = add_encoding_parameter(model_name, params, categorical_encoding)
     model_class = MODEL_REGISTRY[model_name]
-    if model_name in MODELS_WITHOUT_RANDOM_STATE:
-        return model_class(**params)
+    if not _accepts_random_state(model_class):
+        raise ValueError(
+            f"model '{model_name}' ({model_class.__name__}) has no random_state "
+            f"parameter, so this run cannot be reproduced. Add a seed to it, or "
+            f"remove it from MODEL_REGISTRY - per .dev/RULES.md rule 8 the run "
+            f"stops here rather than training an unseedable model."
+        )
+    # The caller's `random_state` wins. `model_params` in config.yaml commonly
+    # carries one too, and `model_class(random_state=seed, **params)` with both is
+    # `TypeError: got multiple values for keyword argument 'random_state'`. The
+    # explicit argument is the pipeline's single seed, set once from
+    # `random_seed`; a duplicate inside model_params was always a collision, and
+    # failing on it at the constructor tells the reader nothing about which of the
+    # two seeds was meant to win.
+    params.pop("random_state", None)
     return model_class(random_state=seed, **params)
 
 
-def score_model(model, features: pd.DataFrame, target: pd.Series) -> dict[str, float]:
+def _accepts_random_state(model_class) -> bool:
+    """Whether a model class can be constructed with `random_state`.
+
+    Args:
+        model_class: The estimator class.
+
+    Returns:
+        True if `random_state` is in the constructor's signature, or the class
+        accepts arbitrary keyword arguments.
+
+    Note:
+    Inspected rather than looked up in a list. `MODEL_REGISTRY` already holds
+    every model this pipeline can build, so asking the class is both shorter and
+    impossible to forget when one is added - which is what happened to the
+    hand-written list this replaces.
+    """
+    import inspect
+
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in inspect.signature(model_class.__init__).parameters.values()
+    ):
+        return True
+    return "random_state" in inspect.signature(model_class.__init__).parameters
+
+
+def score_model(
+    model,
+    features: pd.DataFrame,
+    target: pd.Series,
+    decision_threshold: float = 0.5,
+) -> dict[str, float]:
     """Score a fitted model on held-out rows.
 
     Args:
         model: A fitted estimator with predict_proba.
         features: The rows to score.
         target: The answers for those rows.
+        decision_threshold: The cut used for the hard labels. Must be the same
+            value stage 4 uses, or the two reports disagree.
 
     Returns:
         ROC-AUC, accuracy, F1, precision and recall.
@@ -264,9 +317,18 @@ def score_model(model, features: pd.DataFrame, target: pd.Series) -> dict[str, f
         ROC-AUC is reported as well as accuracy because open question 6 asks
         whether the competition scores one or the other. Reporting both means the
         answer is already here. The two agree on the ranking.
+
+        The hard labels are cut at `decision_threshold` applied to the
+        probabilities, not taken from `model.predict`. `predict` uses whatever
+        0.5 the estimator had baked in, so with any other configured threshold
+        stage 3 reported accuracy, F1, precision and recall for one model and
+        stage 4 reported the same four for another - on the same rows, in the same
+        model card, as two different numbers. `ModelTrainerConfig` had no threshold
+        field at all, so the two stages could not agree unless the config happened
+        to say 0.5.
     """
     probabilities = model.predict_proba(features)[:, 1]
-    predictions = model.predict(features)
+    predictions = (probabilities >= decision_threshold).astype(int)
     return {
         "roc_auc": float(roc_auc_score(target, probabilities)),
         "accuracy": float(accuracy_score(target, predictions)),
@@ -346,6 +408,7 @@ def write_model_card(
     validation_metrics: dict[str, float],
     features: list[str],
     seed: int,
+    dropped_features: dict[str, str] | None = None,
 ) -> Path:
     """Write the document that lets someone who was not here understand the model.
 
@@ -356,6 +419,8 @@ def write_model_card(
         validation_metrics: What it scored on the validation split.
         features: The exact feature list, in order.
         seed: The seed used.
+        dropped_features: Column name to the measured reason it is not a feature.
+            Written into the card.
 
     Returns:
         The path of the written card.
@@ -366,6 +431,25 @@ def write_model_card(
     """
     git_commit = get_git_commit()
     feature_lines = "\n".join(f"- {name}" for name in features)
+    # The reasons themselves, not a pointer to config.yaml. The reader of a model
+    # card is someone who was not here and will not go looking; "see config.yaml"
+    # is the one thing that cannot be acted on from the document in front of them.
+    dropped = dropped_features or {}
+    # A list of names is accepted as well as a name -> reason mapping, because
+    # that is the shape an older features.json carries: stage 2 wrote the literal
+    # string "see config.yaml dropped_features" under this key, and a reader
+    # upgrading the artifacts would hand us a string or a list. Normalised here so
+    # the caller does not have to know which it has.
+    if isinstance(dropped, str):
+        entries = [(dropped, "recorded before the reason was stored")]
+    elif isinstance(dropped, dict):
+        entries = list(dropped.items())
+    else:
+        entries = [(str(name), "no reason recorded") for name in dropped]
+    dropped_lines = (
+        "\n".join(f"- `{column}` - {reason}" for column, reason in entries)
+        or "- (none recorded)"
+    )
     card = f"""# Model Card: {model_name}
 
 **Written automatically by stage 3. Do not edit by hand - re-run the pipeline.**
@@ -414,9 +498,10 @@ Measured on the validation split:
 - The training data is **synthetic**, generated by the competition organisers from
   a model fitted to a real survey. A good score here is not a finding about real
   airline passengers.
-- Six columns were dropped for carrying no signal: see `config.yaml`
-  `dropped_features`. If any of them matter in the real world, this model misses
-  it.
+- These columns were measured and dropped. If any of them matter in the real
+  world, this model misses it:
+
+{dropped_lines}
 - Whether `0` in twelve of the thirteen service ratings means "worst possible" or
   "not applicable" is unanswered. If it means "not applicable", the model is
   treating a missing value as a number. See `docs/column_dictionary.md` Note 3.
@@ -484,16 +569,21 @@ def run_model_training(
     # features themselves, in features.json, which stage 2 wrote - so it is read
     # from there rather than assumed here.
     contract = load_json(config.train_data_path.parent / "features.json")
+    categorical_columns = list(contract.get("categorical_columns", []))
+    category_maps = contract.get("category_maps") or {}
+    encoding = str(contract.get("categorical_encoding", "one_hot"))
     train_data = apply_categorical_encoding(
         train_data,
-        list(contract.get("categorical_columns", [])),
-        str(contract.get("categorical_encoding", "one_hot")),
+        categorical_columns,
+        encoding,
         "train",
+        category_maps,
     )
     log_step(
         "train",
-        encoding=str(contract.get("categorical_encoding", "one_hot")),
-        categorical_columns=len(contract.get("categorical_columns", [])),
+        encoding=encoding,
+        categorical_columns=len(categorical_columns),
+        pinned_levels=len(category_maps),
     )
     check_columns(
         "train", set(train_data.columns), set(config.features) | {config.target_column}
@@ -528,14 +618,16 @@ def run_model_training(
     if validation_data_path is not None and Path(validation_data_path).exists():
         validation_data = apply_categorical_encoding(
             pd.read_csv(validation_data_path),
-            list(contract.get("categorical_columns", [])),
-            str(contract.get("categorical_encoding", "one_hot")),
+            categorical_columns,
+            encoding,
             "validate",
+            category_maps,
         )
         validation_metrics = score_model(
             model,
             validation_data[config.features],
             validation_data[config.target_column],
+            config.decision_threshold,
         )
         log_step(
             "validate",
@@ -591,6 +683,11 @@ def run_model_training(
         validation_metrics,
         config.features,
         config.random_seed,
+        # Read from stage 2's contract, which reads it from config.yaml, so the
+        # card cannot quote a different set of dropped columns than the run used.
+        (load_json(config.train_data_path.parent / "features.json").get(
+            "dropped_features"
+        ) or {}),
     )
     log_step("train", wrote=str(model_path), version=config.model_dir.name)
 

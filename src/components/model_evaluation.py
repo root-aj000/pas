@@ -30,11 +30,26 @@ from src.entity.config_entity import (
 from src.utils.common import (
     apply_categorical_encoding,
     check_columns,
-    get_logger,
     load_json,
     log_step,
     save_dataframe,
 )
+
+# How many of the worst-scoring wrong rows to keep for the report. Separate from
+# `read_errors`' own default because the count of mistakes is reported separately
+# and must not be read off the length of a truncated table.
+ERROR_PREVIEW_LIMIT = 20
+
+# The metrics stage 4 can compute, and how the report names them. `config.yaml`'s
+# `metrics` list selects from these keys; see `write_report`.
+METRIC_LABELS: dict[str, str] = {
+    "roc_auc": "ROC-AUC",
+    "accuracy": "Accuracy",
+    "f1": "F1",
+    "precision": "Precision",
+    "recall": "Recall",
+}
+SUPPORTED_METRICS = frozenset(METRIC_LABELS)
 
 
 def calculate_metrics(
@@ -55,6 +70,13 @@ def calculate_metrics(
     Note:
         ROC-AUC is computed on the probabilities, not the hard labels. Ranking is
         what AUC measures, and a threshold would throw that away.
+
+        `labels=[0, 1]` is passed so the matrix is always 2x2. Without it sklearn
+        drops the labels absent from the data, so a threshold above every predicted
+        probability - or a degenerate split - yields a 1x1 matrix and `.ravel()`
+        unpacks one value into four names: `ValueError: not enough values to
+        unpack (expected 4, got 1)`. That is a confusing way to learn the threshold
+        is too high.
     """
     from sklearn.metrics import (
         accuracy_score,
@@ -65,7 +87,7 @@ def calculate_metrics(
     )
 
     true_negative, false_positive, false_negative, true_positive = confusion_matrix(
-        target, predictions
+        target, predictions, labels=[0, 1]
     ).ravel()
     return EvaluationMetrics(
         roc_auc=float(roc_auc_score(target, probabilities)),
@@ -94,13 +116,22 @@ def read_errors(
         target: The answers.
         probabilities: The model's probability of satisfaction.
         limit: How many rows to return.
+        decision_threshold: The cut used for the hard labels. This must be the
+            same value the reported metrics used; at the default 0.5 a
+            non-default threshold produces an error table describing a different
+            model's mistakes than the one the report scores.
 
     Returns:
-        A frame of the model's worst mistakes.
+        A frame of the model's worst mistakes, at most `limit` rows.
 
     Note:
         .lead/02-C Step 9 calls this the highest-yield hour of the whole step. The
         second row of such a table is usually the next feature idea.
+
+        The return value is truncated, so `len(result)` is the preview size rather
+        than the number of mistakes. Callers that want the real count have to count
+        it themselves - logging this length as "N wrong rows" reported 20 whatever
+        the true figure was.
     """
     scored = pd.DataFrame(
         {
@@ -130,6 +161,7 @@ def write_evaluation_report(
     errors: pd.DataFrame,
     submission_rows: int,
     decision_threshold: float,
+    metrics: list[str],
 ) -> None:
     """Write the evaluation report in plain English.
 
@@ -142,8 +174,34 @@ def write_evaluation_report(
         errors: The rows the model got wrong.
         submission_rows: How many rows the submission file holds.
         decision_threshold: The cut used for the hard labels.
+        metrics: Which metrics to put in the report's Scores table. Must be names
+            this stage can produce.
     """
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    unknown = sorted(set(metrics) - SUPPORTED_METRICS)
+    if unknown:
+        raise ValueError(
+            f"config.yaml asks for {unknown}, which stage 4 cannot produce. "
+            f"Supported: {sorted(SUPPORTED_METRICS)}."
+        )
+    # Built from `metrics`, so the list in config.yaml decides the table. It used to
+    # be read into `ModelEvaluationConfig` and then never consulted: the table above
+    # was hard-coded, so setting `metrics: [roc_auc]` did not remove f1, precision and
+    # recall, and - because the key is `require_key`d - deleting it crashed the run
+    # while changing it did nothing. That is the worst of both: a setting that looks
+    # live and is not.
+    #
+    # ROC-AUC is always kept. It is the headline number, it is the one the
+    # competition scores, and removing it from the table while leaving it in the
+    # comparison below would produce a report nobody could read.
+    shown = [name for name in SUPPORTED_METRICS if name in metrics]
+    if "roc_auc" not in shown:
+        shown.insert(0, "roc_auc")
+    rows = "\n".join(
+        f"| {label} | {getattr(validation, name):.6f} | {getattr(test, name):.6f} |"
+        for name, label in METRIC_LABELS.items()
+        if name in shown
+    )
     # A fenced block, not to_markdown(). pandas needs the tabulate package for
     # to_markdown(), and adding a dependency to render ten rows of a report is
     # exactly what .dev/RULES.md rule 9 warns against.
@@ -156,11 +214,7 @@ def write_evaluation_report(
 
 | Metric | Validation | Test (measured once) |
 |---|---|---|
-| ROC-AUC | {validation.roc_auc:.6f} | **{test.roc_auc:.6f}** |
-| Accuracy | {validation.accuracy:.6f} | **{test.accuracy:.6f}** |
-| F1 | {validation.f1:.6f} | {test.f1:.6f} |
-| Precision | {validation.precision:.6f} | {test.precision:.6f} |
-| Recall | {validation.recall:.6f} | {test.recall:.6f} |
+{rows}
 
 ## Against the bar
 
@@ -250,7 +304,21 @@ def write_submission(
             "satisfaction": probabilities,
         }
     )
+    # Reindexed onto the template's column order, then compared as an ordered list.
+    # `check_columns` computes `expected - actual`, so it only ever caught template
+    # columns the submission lacked - and the submission's two columns are hard-coded
+    # just above, so it could catch exactly one thing. It never checked order, never
+    # checked for extra columns, and so could not detect the failure it is standing
+    # in for. A competition that reads the template's second column by position
+    # scores `id` instead of the prediction.
+    submission = submission.reindex(columns=list(template.columns))
     check_columns("submission", set(submission.columns), set(template.columns))
+    if list(submission.columns) != list(template.columns):
+        raise ValueError(
+            f"submission columns {list(submission.columns)} do not match the "
+            f"template's {list(template.columns)}. A submission has to match the "
+            f"template's columns, in its order."
+        )
     save_dataframe(submission, output_path)
     return len(submission)
 
@@ -281,30 +349,35 @@ def run_model_evaluation(config: ModelEvaluationConfig) -> ModelEvaluationArtifa
                 "python -m src.pipeline.stage_03_model_training"
             )
 
-    logger = get_logger()
     model = joblib.load(config.model_path)
+    # Checked before it is dereferenced. The `check_columns` call came second, so a
+    # contract missing `features` produced a bare KeyError from the line above
+    # rather than the intended message naming features.json - and the file is read
+    # twice below, once for each of the two purposes it serves.
     saved = load_json(config.features_path)
-    features: list[str] = saved["features"]
     check_columns("evaluate", set(saved.keys()), {"features"})
+    features: list[str] = saved["features"]
 
     # The encoding contract comes from features.json, written by stage 2 beside the
     # features themselves. CSV does not carry dtypes, so without this the four
     # categorical columns arrive as `str` and xgboost rejects them.
-    contract = load_json(config.features_path)
-    categorical_columns = list(contract.get("categorical_columns", []))
-    encoding = str(contract.get("categorical_encoding", "one_hot"))
+    categorical_columns = list(saved.get("categorical_columns", []))
+    encoding = str(saved.get("categorical_encoding", "one_hot"))
+    category_maps = saved.get("category_maps") or {}
 
     validation_data = apply_categorical_encoding(
         pd.read_csv(config.validation_data_path),
         categorical_columns,
         encoding,
         "evaluate.validation",
+        category_maps,
     )
     test_data = apply_categorical_encoding(
         pd.read_csv(config.test_data_path),
         categorical_columns,
         encoding,
         "evaluate.test",
+        category_maps,
     )
     check_columns(
         "evaluate.validation",
@@ -315,13 +388,14 @@ def run_model_evaluation(config: ModelEvaluationConfig) -> ModelEvaluationArtifa
         "evaluate.test", set(test_data.columns), set(features) | {config.target_column}
     )
 
+    # Predicted once. This was called twice on validation and once on test, and on
+    # 105k rows by 178 features with a RealMLP it is the most expensive operation
+    # in the stage - three times over, for one number.
+    validation_probabilities = model.predict_proba(validation_data[features])[:, 1]
     validation_metrics = calculate_metrics(
         validation_data[config.target_column],
-        model.predict_proba(validation_data[features])[:, 1],
-        (
-            model.predict_proba(validation_data[features])[:, 1]
-            >= config.decision_threshold
-        ).astype(int),
+        validation_probabilities,
+        (validation_probabilities >= config.decision_threshold).astype(int),
     )
     test_probabilities = model.predict_proba(test_data[features])[:, 1]
     test_metrics = calculate_metrics(
@@ -337,15 +411,33 @@ def run_model_evaluation(config: ModelEvaluationConfig) -> ModelEvaluationArtifa
         test_accuracy=round(test_metrics.accuracy, 6),
     )
 
-    errors = read_errors(test_data, test_data[config.target_column], test_probabilities)
-    logger.info("[errors] %d wrong rows, worst-confidence first", len(errors))
-    logger.info("\n%s", errors.head(10).to_string(index=False))
+    # The configured threshold, not `read_errors`' own 0.5. The metrics above cut
+    # at `decision_threshold` and the error table cut at 0.5, so with any other
+    # setting the rows a reviewer reads as "wrong" were the rows a different model
+    # would have got wrong - and the confusion matrix in the report, which is
+    # built from these labels, disagreed with the metrics printed beside it.
+    errors = read_errors(
+        test_data,
+        test_data[config.target_column],
+        test_probabilities,
+        decision_threshold=config.decision_threshold,
+        limit=ERROR_PREVIEW_LIMIT,
+    )
+    # `read_errors` returns a truncated table, so `len(errors)` is the preview size
+    # and not the number of mistakes. Logging that as "N wrong rows" reported 20
+    # when the real figure was in the thousands.
+    wrong_total = int(
+        ((test_probabilities >= config.decision_threshold).astype(np.int64)
+         != test_data[config.target_column].to_numpy()).sum()
+    )
+    log_step("errors", wrong_rows=wrong_total, preview=len(errors))
 
     competition_frame = apply_categorical_encoding(
         pd.read_csv(config.competition_test_path),
         categorical_columns,
         encoding,
         "evaluate.competition",
+        category_maps,
     )
     check_columns("evaluate.competition", set(competition_frame.columns), set(features))
     competition_probabilities = model.predict_proba(competition_frame[features])[:, 1]
@@ -374,6 +466,7 @@ def run_model_evaluation(config: ModelEvaluationConfig) -> ModelEvaluationArtifa
         errors=errors,
         submission_rows=submission_rows,
         decision_threshold=config.decision_threshold,
+        metrics=list(config.metrics),
     )
 
     return ModelEvaluationArtifact(

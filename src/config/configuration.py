@@ -27,6 +27,7 @@ from src.entity.config_entity import (
     ModelEvaluationConfig,
     ModelTrainerConfig,
     PipelineConfig,
+    ViewConfig,
 )
 from src.utils.common import (
     describe_kaggle_input,
@@ -253,6 +254,15 @@ class PipelineConfigReader:
             ),
             derived_feature_names=derived_names,
             banned_features=frozenset(require_key(self.config, "banned_features")),
+            # Recorded rather than replaced with the string "see config.yaml".
+            # The model card lists what was dropped and why, and a pointer to the
+            # config is not a reason - the reader is already looking at the card.
+            dropped_features={
+                str(column): str(reason)
+                for column, reason in (
+                    require_key(self.config, "dropped_features") or {}
+                ).items()
+            },
             service_rating_columns=list(SERVICE_RATING_COLUMNS),
             categorical_columns=list(CATEGORICAL_COLUMNS),
             continuous_columns=list(CONTINUOUS_COLUMNS),
@@ -264,6 +274,9 @@ class PipelineConfigReader:
             clip_upper_percentile=float(self.config.get("clip_upper_percentile", 99.9)),
             arrival_delay_median=float(
                 self.config.get("arrival_delay_median_for_model", 0.0)
+            ),
+            arrival_delay_column=str(
+                self.config.get("arrival_delay_column", "Arrival Delay in Minutes")
             ),
             categorical_encoding=self._read_categorical_encoding(),
             route_features_enabled=bool(
@@ -312,6 +325,47 @@ class PipelineConfigReader:
             random_seed=int(require_key(self.config, "random_seed")),
             max_training_seconds=int(require_key(self.config, "max_training_seconds")),
             categorical_encoding=self._read_categorical_encoding(),
+            decision_threshold=float(require_key(self.config, "decision_threshold")),
+        )
+
+    def create_view_config(self) -> ViewConfig:
+        """Return stage 6's feature-view settings.
+
+        Returns:
+            The candidate views and the acceptance threshold, disabled when the
+            `feature_views` block is absent.
+
+        Note:
+        Defaults to disabled, like the ensemble block. A config with no
+        `feature_views` key is a config that does not want the extra search, and
+        running one by default would add an hour of training to a pipeline nobody
+        asked to extend.
+
+        `min_gain` is read from config rather than defaulted to a literal, because
+        it is a decision about what counts as a real improvement and the reasoning
+        behind the number belongs next to the number.
+        """
+        block = self.config.get("feature_views") or {}
+        if not isinstance(block, dict):
+            block = {}
+        views = [dict(entry) for entry in (block.get("views") or [])]
+        for entry in views:
+            if "name" not in entry:
+                raise ValueError(
+                    f"every entry under feature_views.views needs a name: {entry}"
+                )
+        names = [str(entry["name"]) for entry in views]
+        duplicates = {n for n in names if names.count(n) > 1}
+        if duplicates:
+            raise ValueError(
+                f"feature_views.views has duplicate names: {sorted(duplicates)}. "
+                f"Two views writing the same oof_<name>.npy would overwrite each "
+                f"other."
+            )
+        return ViewConfig(
+            enabled=bool(block.get("enabled", False)),
+            views=views,
+            min_gain=float(block.get("min_gain", 0.0004)),
         )
 
     def create_evaluation_config(self, model_version: int) -> ModelEvaluationConfig:
@@ -378,6 +432,7 @@ class PipelineConfigReader:
                 params=dict(entry.get("params") or {}),
                 drop_prefix=tuple(entry.get("drop_prefix") or ()),
                 drop_suffix=tuple(entry.get("drop_suffix") or ()),
+                keep_prefixes=tuple(entry.get("keep_prefixes") or ()),
                 target_encodings=bool(entry.get("target_encodings", True)),
             )
             for entry in (block.get("members") or [])
@@ -394,6 +449,11 @@ class PipelineConfigReader:
             pseudo_label_enabled=bool(block.get("pseudo_label_enabled", False)),
             pseudo_label_high=float(block.get("pseudo_label_high", 0.95)),
             pseudo_label_low=float(block.get("pseudo_label_low", 0.05)),
+            save_models=bool(block.get("save_models", False)),
+            cpu_one_process_per_member=bool(
+                block.get("cpu_one_process_per_member", True)
+            ),
+            resume=bool(block.get("resume", True)),
         )
 
     def create_pipeline_config(self, model_version: int = 1) -> PipelineConfig:

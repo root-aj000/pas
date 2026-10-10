@@ -36,13 +36,20 @@ class DataIngestionArtifact:
 
 @dataclass(frozen=True)
 class DataCleaningConfig:
-    """Settings needed to split, derive features and encode categories."""
+    """Settings needed to split, derive features and encode categories.
+
+    Note:
+    `dropped_features` maps each column the pipeline decided not to use to the
+    measured reason. It is carried into the model card, where a reader needs the
+    number, not the name of the file it came from.
+    """
 
     target_column: str
     features: list[str]
     candidate_features_pending_question: list[str]
     derived_feature_names: list[str]
     banned_features: frozenset[str]
+    dropped_features: dict[str, str]
     service_rating_columns: list[str]
     categorical_columns: list[str]
     continuous_columns: list[str]
@@ -53,6 +60,16 @@ class DataCleaningConfig:
     clip_lower_percentile: float
     clip_upper_percentile: float
     arrival_delay_median: float
+    """The value that WOULD be substituted for a blank delay.
+
+    Blanks are kept as the `arrival_delay_status: unknown` group instead, so this
+    is recorded every run and deliberately not applied. It used to be read and used
+    by nothing at all.
+    """
+
+    arrival_delay_column: str
+    """Which column `arrival_delay_status` groups. Previously hard-coded."""
+
     categorical_encoding: str
     route_features_enabled: bool
     route_smoothing: float
@@ -91,6 +108,15 @@ class ModelTrainerConfig:
     random_seed: int
     max_training_seconds: int
     categorical_encoding: str
+    decision_threshold: float
+    """The cut used for hard labels here and in stage 4.
+
+    Stage 3 reports accuracy, F1, precision and recall on validation, and stage 4
+    reports the same four on validation and test. Without this field the two cut
+    at different places - `model.predict`'s baked-in 0.5 here, `config
+    .decision_threshold` there - so the same rows scored two ways in one model
+    card.
+    """
 
 
 @dataclass(frozen=True)
@@ -148,6 +174,30 @@ class ModelEvaluationArtifact:
     test_metrics: EvaluationMetrics
     validation_metrics: EvaluationMetrics
     submission_rows: int
+
+
+@dataclass(frozen=True)
+class ViewConfig:
+    """Which feature views stage 6 should try, and the bar to clear.
+
+    Note:
+    A view is a narrower column set the same estimator is trained on, not a
+    different architecture. The point is decorrelation: stage 5's four members all
+    see the same columns and score below their own best member when stacked, while
+    the same model scores 0.9524 on the ratings alone and 0.9591 on everything -
+    a +0.0067 spread that is what a stack can combine.
+
+    `min_gain` is the acceptance threshold on the NESTED stack AUC, in AUC units.
+    The nested score moves by roughly +/-0.0003 between fold seeds on this
+    dataset, so 0.0004 sits just above the measured noise: a real effect clears it
+    and a lucky seed does not. Lowering it to 0.0001 would accept views that are
+    indistinguishable from re-drawing the folds, which is how a stack grows four
+    members and gains nothing.
+    """
+
+    enabled: bool
+    views: list[dict[str, Any]]
+    min_gain: float
 
 
 @dataclass(frozen=True)
